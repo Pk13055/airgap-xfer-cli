@@ -49,7 +49,7 @@ pub fn set_temp_path(path: Option<PathBuf>) {
 }
 
 fn interrupted_err() -> Error {
-    Error::Message("interrupted".into())
+    Error::Interrupted
 }
 
 fn check_interrupted() -> Result<()> {
@@ -104,17 +104,11 @@ impl LiveOptical {
         Ok(Self {
             camera: cam,
             version: 10,
-            invert: !no_invert,
+            // Plan default (invert == false): dark modules on a light quiet
+            // zone. `--no-invert` (no_invert == true) flips to invert == true.
+            invert: no_invert,
             status: String::new(),
         })
-    }
-
-    pub fn set_version(&mut self, v: u8) {
-        self.version = v;
-    }
-
-    pub fn set_status(&mut self, status: &str) {
-        self.status = status.to_string();
     }
 }
 
@@ -138,6 +132,14 @@ impl Optical for LiveOptical {
         writeln!(stdout, "{}", self.status)?;
         stdout.flush()?;
         Ok(())
+    }
+
+    fn set_status(&mut self, status: &str) {
+        self.status = status.to_string();
+    }
+
+    fn set_version(&mut self, v: u8) {
+        self.version = v;
     }
 
     fn poll(&mut self, timeout: Duration) -> Result<Option<frame::Payload>> {

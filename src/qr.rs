@@ -46,22 +46,36 @@ pub fn decode_image(img: &GrayImage) -> Result<Vec<u8>> {
     .map_err(|_| Error::BadFrame)
 }
 
-/// Renders two image rows per terminal row using Unicode block characters.
+/// Renders two QR modules per terminal row using Unicode block characters.
+///
+/// `encode_version` rasters at `MODULE_SCALE` pixels per module so the rxing
+/// decoder has enough resolution for a reliable round-trip. Terminals need
+/// one column per *module*, not one column per pixel, so this samples the
+/// center pixel of each module rather than emitting the raw pixel grid
+/// (which would make a version 10 code ~260 columns wide).
+///
+/// Forces a light quiet zone / dark modules via ANSI SGR codes (white
+/// background, black foreground) so the code renders correctly regardless
+/// of the terminal's color theme.
 pub fn render_terminal(img: &GrayImage, invert: bool) -> String {
-    let mut output = String::new();
-    let width = img.width() as usize;
-    let height = img.height() as usize;
-    let side_quiet_zone = " ".repeat(width);
+    let modules_side = img.width() as usize / MODULE_SCALE;
+    let sample = |mx: usize, my: usize| -> bool {
+        let px = (mx * MODULE_SCALE + MODULE_SCALE / 2) as u32;
+        let py = (my * MODULE_SCALE + MODULE_SCALE / 2) as u32;
+        is_dark(img.get_pixel(px, py)[0], invert)
+    };
 
-    output.push_str(&side_quiet_zone);
+    let mut output = String::new();
+    output.push_str("\x1b[47m\x1b[30m");
+
+    let blank_row = " ".repeat(modules_side);
+    output.push_str(&blank_row);
     output.push('\n');
 
-    for y in (0..height).step_by(2) {
-        output.push(' ');
-        for x in 0..width {
-            let upper_dark = is_dark(img.get_pixel(x as u32, y as u32)[0], invert);
-            let lower_dark = y + 1 < height
-                && is_dark(img.get_pixel(x as u32, (y + 1) as u32)[0], invert);
+    for y in (0..modules_side).step_by(2) {
+        for x in 0..modules_side {
+            let upper_dark = sample(x, y);
+            let lower_dark = y + 1 < modules_side && sample(x, y + 1);
             output.push(match (upper_dark, lower_dark) {
                 (true, true) => '█',
                 (true, false) => '▀',
@@ -69,12 +83,12 @@ pub fn render_terminal(img: &GrayImage, invert: bool) -> String {
                 (false, false) => ' ',
             });
         }
-        output.push(' ');
         output.push('\n');
     }
 
-    output.push_str(&side_quiet_zone);
+    output.push_str(&blank_row);
     output.push('\n');
+    output.push_str("\x1b[0m");
     output
 }
 
@@ -105,5 +119,23 @@ mod tests {
         let s = render_terminal(&img, false);
         assert!(s.contains('█') || s.contains('▀') || s.contains('▄'));
         assert!(s.contains('\n'));
+    }
+
+    #[test]
+    fn terminal_render_width_is_module_count_not_pixel_count_for_version_10() {
+        let img = encode_version(b"AX-test", 10).unwrap();
+        // encode_version rasters at MODULE_SCALE=4 px/module, so a naive
+        // per-pixel render would be 260 columns wide. render_terminal must
+        // downsample to one column per module: 21 + 4*9 (modules for
+        // version 10) + 8 (quiet zone) = 65 columns.
+        assert_eq!(img.width(), 260);
+        let raw = render_terminal(&img, false);
+        let plain = raw.replace("\x1b[47m\x1b[30m", "").replace("\x1b[0m", "");
+        let max_width = plain.lines().map(|l| l.chars().count()).max().unwrap_or(0);
+        assert_eq!(max_width, 65);
+        assert!(
+            max_width < 100,
+            "QR render must fit a normal terminal, got {max_width} columns"
+        );
     }
 }

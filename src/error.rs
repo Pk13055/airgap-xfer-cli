@@ -23,6 +23,8 @@ pub enum Error {
     Stalled(Vec<u32>),
     #[error("bad frame")]
     BadFrame,
+    #[error("interrupted")]
+    Interrupted,
     #[error("{0}")]
     Message(String),
 }

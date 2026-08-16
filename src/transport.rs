@@ -44,6 +44,14 @@ fn expected_chunk_count(blob_len: usize, chunk_size: usize) -> Option<u32> {
     u32::try_from(blob_len.div_ceil(chunk_size)).ok()
 }
 
+/// Builds the status line shown under the QR code: window progress, holes,
+/// and throughput.
+fn status_line(base: u32, end: u32, chunk_count: u32, holes: usize, elapsed: Duration) -> String {
+    let secs = elapsed.as_secs_f64().max(0.001);
+    let kbps = (base as f64 / secs).max(0.0);
+    format!("window {base}-{end}/{chunk_count} holes:{holes} {kbps:.1} chunks/s")
+}
+
 fn missing_seqs(base: u32, end: u32, bitmap: u32) -> Vec<u32> {
     (base..end)
         .filter(|seq| bitmap & (1 << (seq - base)) == 0)
@@ -87,9 +95,11 @@ pub fn send_blob(
         return Err(Error::HandshakeFailed);
     }
 
+    let start_time = Instant::now();
     let mut base = 0;
     while base < chunk_count {
         let end = (base + WINDOW).min(chunk_count);
+        opt.set_status(&status_line(base, end, chunk_count, 0, start_time.elapsed()));
         show_data(
             opt,
             blob,
@@ -136,6 +146,13 @@ pub fn send_blob(
             }
             previous_bitmap = bitmap;
 
+            opt.set_status(&status_line(
+                base,
+                end,
+                chunk_count,
+                missing.len(),
+                start_time.elapsed(),
+            ));
             for seq in missing {
                 let start = seq as usize * chunk_size;
                 let end = (start + chunk_size).min(blob.len());
@@ -151,6 +168,7 @@ pub fn send_blob(
         base = end;
     }
 
+    opt.set_status(&status_line(chunk_count, chunk_count, chunk_count, 0, start_time.elapsed()));
     opt.show(&Payload::Fin {
         sha256: session.sha256,
     })?;
@@ -185,10 +203,13 @@ pub fn recv_blob(
     let mut got = HashSet::new();
     let mut blob = vec![0; compressed_size];
     let mut base = 0;
+    let start_time = Instant::now();
+    let mut idle_polls: u32 = 0;
 
     loop {
         match opt.poll(ack_timeout(cfg))? {
             Some(Payload::Data { seq, chunk }) => {
+                idle_polls = 0;
                 let end = (base + WINDOW).min(chunk_count);
                 if seq < base {
                     if got.contains(&seq) {
@@ -226,6 +247,8 @@ pub fn recv_blob(
                         0
                     }
                 });
+                let holes = (base..end).filter(|c| !got.contains(c)).count();
+                opt.set_status(&status_line(base, end, chunk_count, holes, start_time.elapsed()));
                 opt.show(&Payload::Ack {
                     window_base: base,
                     bitmap,
@@ -244,10 +267,29 @@ pub fn recv_blob(
                     opt.show(&Payload::Fail { reason: FAIL_HASH })?;
                     return Err(Error::HashMismatch);
                 }
-                opt.show(&Payload::Ok)?;
+                // Do not show OK yet: the caller still needs to durably
+                // write (and, on the CLI path, unpack) the blob. OK is only
+                // sent once that succeeds, so the sender never sees OK
+                // before the data is safely on disk.
                 return Ok(blob);
             }
-            Some(_) | None => {}
+            Some(_) | None => {
+                idle_polls += 1;
+                if idle_polls >= STALL_LIMIT {
+                    let end = (base + WINDOW).min(chunk_count);
+                    return Err(Error::Stalled(missing_seqs(
+                        base,
+                        end,
+                        (base..end).fold(0, |bits, candidate| {
+                            bits | if got.contains(&candidate) {
+                                1 << (candidate - base)
+                            } else {
+                                0
+                            }
+                        }),
+                    )));
+                }
+            }
         }
     }
 }
@@ -313,7 +355,13 @@ mod tests {
             let sess = sess.clone();
             move || send_blob(&mut s, &sess, &blob, cfg).unwrap()
         });
-        let rt = thread::spawn(move || recv_blob(&mut r, &sess, cfg).unwrap());
+        let rt = thread::spawn(move || {
+            let blob = recv_blob(&mut r, &sess, cfg).unwrap();
+            // recv_blob no longer sends OK itself (the caller must durably
+            // write/unpack first); simulate that here so send_blob unblocks.
+            r.show(&Payload::Ok).unwrap();
+            blob
+        });
         st.join().unwrap();
         assert_eq!(rt.join().unwrap(), blob);
     }
@@ -333,7 +381,11 @@ mod tests {
             let sess = sess.clone();
             move || send_blob(&mut s, &sess, &blob, cfg).unwrap()
         });
-        let rt = thread::spawn(move || recv_blob(&mut r, &sess, cfg).unwrap());
+        let rt = thread::spawn(move || {
+            let blob = recv_blob(&mut r, &sess, cfg).unwrap();
+            r.show(&Payload::Ok).unwrap();
+            blob
+        });
         st.join().unwrap();
         assert_eq!(rt.join().unwrap(), blob);
     }
@@ -353,7 +405,11 @@ mod tests {
             let sess = sess.clone();
             move || send_blob(&mut s, &sess, &blob, cfg).unwrap()
         });
-        let rt = thread::spawn(move || recv_blob(&mut r, &sess, cfg).unwrap());
+        let rt = thread::spawn(move || {
+            let blob = recv_blob(&mut r, &sess, cfg).unwrap();
+            r.show(&Payload::Ok).unwrap();
+            blob
+        });
         st.join().unwrap();
         assert_eq!(rt.join().unwrap(), blob);
     }
@@ -370,7 +426,11 @@ mod tests {
             let sess = sess.clone();
             move || send_blob(&mut s, &sess, &blob, cfg).unwrap()
         });
-        let rt = thread::spawn(move || recv_blob(&mut r, &sess, cfg).unwrap());
+        let rt = thread::spawn(move || {
+            let blob = recv_blob(&mut r, &sess, cfg).unwrap();
+            r.show(&Payload::Ok).unwrap();
+            blob
+        });
         st.join().unwrap();
         assert_eq!(rt.join().unwrap(), blob);
     }
@@ -390,7 +450,11 @@ mod tests {
             let sess = sess.clone();
             move || send_blob(&mut s, &sess, &blob, cfg).unwrap()
         });
-        let rt = thread::spawn(move || recv_blob(&mut r, &sess, cfg).unwrap());
+        let rt = thread::spawn(move || {
+            let blob = recv_blob(&mut r, &sess, cfg).unwrap();
+            r.show(&Payload::Ok).unwrap();
+            blob
+        });
         st.join().unwrap();
         assert_eq!(rt.join().unwrap(), blob);
     }
@@ -433,5 +497,18 @@ mod tests {
         let recv_res = rt.join().unwrap();
         assert!(matches!(recv_res, Err(crate::Error::HashMismatch)));
         assert!(matches!(st.join().unwrap(), Err(crate::Error::HashMismatch)));
+    }
+
+    #[test]
+    fn recv_blob_aborts_after_sustained_idle_polls_instead_of_looping_forever() {
+        let blob = vec![1u8; 10];
+        let sess = session_for(&blob, 10);
+        // Keep the peer alive but silent: poll always times out (Ok(None)),
+        // which used to loop forever. It must now abort with a bounded
+        // number of idle polls instead of hanging.
+        let (_send_end, mut recv_end) = pair();
+        let cfg = TransportConfig { fast: true };
+        let err = recv_blob(&mut recv_end, &sess, cfg).unwrap_err();
+        assert!(matches!(err, Error::Stalled(_)));
     }
 }

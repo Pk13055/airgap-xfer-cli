@@ -11,6 +11,14 @@ use std::{
 pub trait Optical {
     fn show(&mut self, payload: &Payload) -> Result<()>;
     fn poll(&mut self, timeout: Duration) -> Result<Option<Payload>>;
+
+    /// Updates the status line shown under the QR code (e.g. window
+    /// progress, holes, throughput). No-op by default.
+    fn set_status(&mut self, _status: &str) {}
+
+    /// Sets the QR version used to encode non-probe payloads. No-op by
+    /// default.
+    fn set_version(&mut self, _version: u8) {}
 }
 
 pub struct PairEnd {

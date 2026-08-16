@@ -3,8 +3,11 @@ use std::fs;
 use std::path::PathBuf;
 
 use crate::{
+    frame,
     link::{self, LinkConfig},
-    live, pack, transport,
+    live,
+    optical::Optical,
+    pack, transport,
     transport::TransportConfig,
 };
 
@@ -70,7 +73,7 @@ pub fn run() -> crate::Result<()> {
 }
 
 fn is_interrupted(result: &crate::Result<()>) -> bool {
-    matches!(result, Err(crate::Error::Message(m)) if m == "interrupted")
+    matches!(result, Err(crate::Error::Interrupted))
 }
 
 fn send(path: PathBuf, camera: u32, keep_temp: bool, no_invert: bool) -> crate::Result<()> {
@@ -91,7 +94,6 @@ fn send(path: PathBuf, camera: u32, keep_temp: bool, no_invert: bool) -> crate::
             packed.sha256,
             cfg,
         )?;
-        opt.set_version(session.qr_version);
         transport::send_blob(&mut opt, &session, &blob, TransportConfig { fast: false })?;
         Ok(())
     })();
@@ -113,14 +115,14 @@ fn recv(
     keep_temp: bool,
     no_invert: bool,
 ) -> crate::Result<()> {
-    let blob = {
-        let mut opt = live::LiveOptical::open(camera, no_invert)?;
-        let cfg = LinkConfig { fast: false };
-        let session = link::run_recv_handshake(&mut opt, &outdir, force, cfg)?;
-        opt.set_version(session.qr_version);
-        transport::recv_blob(&mut opt, &session, TransportConfig { fast: false })?
-    };
+    let mut opt = live::LiveOptical::open(camera, no_invert)?;
+    let cfg = LinkConfig { fast: false };
+    let session = link::run_recv_handshake(&mut opt, &outdir, force, cfg)?;
+    let blob = transport::recv_blob(&mut opt, &session, TransportConfig { fast: false })?;
 
+    // recv_blob only verifies the hash; it deliberately does not send OK.
+    // The sender must not see OK until the blob is durably written (and
+    // unpacked) here, so write+unpack happens before we show OK/FAIL.
     let temp_path = std::env::temp_dir().join(format!(
         "airgap-xfer-{}-{}.tar.zst",
         std::process::id(),
@@ -129,18 +131,37 @@ fn recv(
             .map_err(|err| crate::Error::Message(format!("system clock before UNIX epoch: {err}")))?
             .as_nanos()
     ));
-    fs::write(&temp_path, &blob)?;
     if !keep_temp {
         live::set_temp_path(Some(temp_path.clone()));
     }
 
-    let result = pack::unpack(&temp_path, &outdir, force).map(|_| ());
+    let write_and_unpack = (|| -> crate::Result<()> {
+        fs::write(&temp_path, &blob)?;
+        pack::unpack(&temp_path, &outdir, force)?;
+        Ok(())
+    })();
+
+    match &write_and_unpack {
+        Ok(()) => {
+            opt.show(&frame::Payload::Ok)?;
+        }
+        Err(crate::Error::Io(io_err)) if io_err.kind() == std::io::ErrorKind::StorageFull => {
+            opt.show(&frame::Payload::Fail {
+                reason: frame::FAIL_DISK,
+            })?;
+        }
+        Err(_) => {
+            opt.show(&frame::Payload::Fail {
+                reason: frame::FAIL_PROTOCOL,
+            })?;
+        }
+    }
 
     live::set_temp_path(None);
     if !keep_temp {
         pack::remove_temp(&temp_path);
     }
-    result
+    write_and_unpack
 }
 
 #[cfg(test)]

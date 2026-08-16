@@ -134,6 +134,10 @@ pub fn run_send_handshake(
         return Err(Error::HandshakeFailed);
     };
 
+    // Lock the QR version before GO is shown so GO (and everything after
+    // it) is encoded at the negotiated version instead of the probe default.
+    opt.set_version(qr_version);
+
     let chunk_size = data_chunk_size(qr_version);
     if chunk_size == 0 {
         return Err(Error::HandshakeFailed);
@@ -178,33 +182,31 @@ pub fn run_recv_handshake(
     let mut saw_last;
 
     loop {
-        if opt
-            .show(&Payload::Hello {
-                protocol_ver: 1,
-                role: ROLE_RECV,
-            })
-            .is_err()
-        {
-            return Err(Error::HandshakeTimeout);
-        }
-
+        // Only the deadline expiring becomes HandshakeTimeout. Real errors
+        // (interrupt, camera failure, peer disconnect) must propagate as-is
+        // so e.g. Ctrl-C during HELLO still surfaces as an interrupt.
         let Some(remaining) = hello_deadline.checked_duration_since(Instant::now()) else {
             return Err(Error::HandshakeTimeout);
         };
+
+        opt.show(&Payload::Hello {
+            protocol_ver: 1,
+            role: ROLE_RECV,
+        })?;
+
         let timeout = remaining.min(Duration::from_millis(50));
-        match opt.poll(timeout) {
-            Ok(Some(Payload::Probe {
+        match opt.poll(timeout)? {
+            Some(Payload::Probe {
                 id,
                 qr_version,
                 dwell_ms,
                 last,
-            })) => {
+            }) => {
                 probes.push((id, qr_version, dwell_ms));
                 saw_last = last;
                 break;
             }
-            Ok(_) => {}
-            Err(_) => return Err(Error::HandshakeTimeout),
+            Some(_) | None => {}
         }
     }
 
@@ -248,6 +250,11 @@ pub fn run_recv_handshake(
         .max_by_key(|(_, qr_version, _)| *qr_version)
         .ok_or(Error::NoUsableProbe)?;
     let probe_loss = (100 * (6 - successful_count) / 6) as u8;
+
+    // Lock the QR version as soon as it's chosen so LINK (and GO) are
+    // encoded at the negotiated version rather than the probe default.
+    opt.set_version(qr_version);
+
     opt.show(&Payload::Link {
         qr_version,
         dwell_ms,
@@ -365,16 +372,156 @@ mod tests {
     }
 
     #[test]
-    fn handshake_all_probes_fail() {
+    fn handshake_no_probe_response_times_out() {
+        // Keep the peer alive but silent: HELLO sends succeed and poll just
+        // keeps timing out, so this must become HandshakeTimeout once the
+        // deadline passes rather than erroring out early.
+        let (_send_end, mut recv_end) = pair();
+        let cfg = LinkConfig { fast: true };
+        let out = std::env::temp_dir();
+        let err = run_recv_handshake(&mut recv_end, &out, false, cfg).unwrap_err();
+        assert!(matches!(err, crate::Error::HandshakeTimeout));
+    }
+
+    #[test]
+    fn hello_loop_propagates_real_errors_instead_of_masking_as_timeout() {
+        struct FailingPollOptical;
+
+        impl Optical for FailingPollOptical {
+            fn show(&mut self, _: &Payload) -> Result<()> {
+                Ok(())
+            }
+
+            fn poll(&mut self, _: Duration) -> Result<Option<Payload>> {
+                Err(Error::Message("boom".into()))
+            }
+        }
+
+        let mut opt = FailingPollOptical;
+        let err = run_recv_handshake(
+            &mut opt,
+            &std::env::temp_dir(),
+            false,
+            LinkConfig { fast: true },
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Message(m) if m == "boom"));
+    }
+
+    #[test]
+    fn hello_loop_propagates_disconnect_instead_of_masking_as_timeout() {
         let (send_end, mut recv_end) = pair();
         drop(send_end);
         let cfg = LinkConfig { fast: true };
         let out = std::env::temp_dir();
         let err = run_recv_handshake(&mut recv_end, &out, false, cfg).unwrap_err();
-        assert!(matches!(
-            err,
-            crate::Error::HandshakeTimeout | crate::Error::NoUsableProbe
-        ));
+        assert!(matches!(err, crate::Error::Message(_)));
+    }
+
+    #[test]
+    fn send_handshake_sets_version_before_go_is_shown() {
+        struct GoVersionRecorder<T> {
+            inner: T,
+            version_set_before_go: Option<bool>,
+            version_set: bool,
+        }
+
+        impl<T: Optical> Optical for GoVersionRecorder<T> {
+            fn show(&mut self, payload: &Payload) -> Result<()> {
+                if matches!(payload, Payload::Go { .. }) && self.version_set_before_go.is_none() {
+                    self.version_set_before_go = Some(self.version_set);
+                }
+                self.inner.show(payload)
+            }
+
+            fn poll(&mut self, timeout: Duration) -> Result<Option<Payload>> {
+                self.inner.poll(timeout)
+            }
+
+            fn set_version(&mut self, _version: u8) {
+                self.version_set = true;
+            }
+        }
+
+        let (send_opt, mut recv_opt) = pair();
+        let mut send_opt = GoVersionRecorder {
+            inner: send_opt,
+            version_set_before_go: None,
+            version_set: false,
+        };
+        let cfg = LinkConfig { fast: true };
+        let blob = vec![1u8, 2, 3, 4, 5];
+        let sha256 = [1u8; 32];
+
+        let send_t = thread::spawn(move || {
+            let result =
+                run_send_handshake(&mut send_opt, "dir".into(), 5, &blob, sha256, cfg);
+            (result, send_opt.version_set_before_go)
+        });
+        let recv_t = thread::spawn(move || {
+            let out = std::env::temp_dir().join(format!("ag-hs-ver-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&out);
+            std::fs::create_dir_all(&out).unwrap();
+            run_recv_handshake(&mut recv_opt, &out, false, cfg).unwrap()
+        });
+
+        let (send_result, version_set_before_go) = send_t.join().unwrap();
+        send_result.unwrap();
+        recv_t.join().unwrap();
+        assert_eq!(version_set_before_go, Some(true));
+    }
+
+    #[test]
+    fn recv_handshake_sets_version_before_link_is_shown() {
+        struct LinkVersionRecorder<T> {
+            inner: T,
+            version_set_before_link: Option<bool>,
+            version_set: bool,
+        }
+
+        impl<T: Optical> Optical for LinkVersionRecorder<T> {
+            fn show(&mut self, payload: &Payload) -> Result<()> {
+                if matches!(payload, Payload::Link { .. }) && self.version_set_before_link.is_none()
+                {
+                    self.version_set_before_link = Some(self.version_set);
+                }
+                self.inner.show(payload)
+            }
+
+            fn poll(&mut self, timeout: Duration) -> Result<Option<Payload>> {
+                self.inner.poll(timeout)
+            }
+
+            fn set_version(&mut self, _version: u8) {
+                self.version_set = true;
+            }
+        }
+
+        let (mut send_opt, recv_opt) = pair();
+        let mut recv_opt = LinkVersionRecorder {
+            inner: recv_opt,
+            version_set_before_link: None,
+            version_set: false,
+        };
+        let cfg = LinkConfig { fast: true };
+        let blob = vec![1u8, 2, 3, 4, 5];
+        let sha256 = [1u8; 32];
+
+        let send_t = thread::spawn(move || {
+            run_send_handshake(&mut send_opt, "dir".into(), 5, &blob, sha256, cfg).unwrap()
+        });
+        let recv_t = thread::spawn(move || {
+            let out = std::env::temp_dir().join(format!("ag-hs-ver2-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&out);
+            std::fs::create_dir_all(&out).unwrap();
+            let result = run_recv_handshake(&mut recv_opt, &out, false, cfg);
+            (result, recv_opt.version_set_before_link)
+        });
+
+        send_t.join().unwrap();
+        let (recv_result, version_set_before_link) = recv_t.join().unwrap();
+        recv_result.unwrap();
+        assert_eq!(version_set_before_link, Some(true));
     }
 
     #[test]

@@ -6,6 +6,7 @@ $DestDir = Join-Path $env:LOCALAPPDATA "airgap-xfer"
 New-Item -ItemType Directory -Force -Path $DestDir | Out-Null
 Copy-Item -Force $Src (Join-Path $DestDir "airgap-xfer.exe")
 $UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
+if (-not $UserPath) { $UserPath = "" }
 if (-not ($UserPath.Split(';') -contains $DestDir)) {
   [Environment]::SetEnvironmentVariable("Path", "$DestDir;$UserPath", "User")
 }
