@@ -18,6 +18,41 @@ pub const KIND_FIN: u8 = 7;
 pub const KIND_OK: u8 = 8;
 pub const KIND_FAIL: u8 = 9;
 
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    Hello = 1,
+    Probe = 2,
+    Link = 3,
+    Go = 4,
+    Data = 5,
+    Ack = 6,
+    Fin = 7,
+    Ok = 8,
+    Fail = 9,
+}
+
+impl Kind {
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            KIND_HELLO => Some(Kind::Hello),
+            KIND_PROBE => Some(Kind::Probe),
+            KIND_LINK => Some(Kind::Link),
+            KIND_GO => Some(Kind::Go),
+            KIND_DATA => Some(Kind::Data),
+            KIND_ACK => Some(Kind::Ack),
+            KIND_FIN => Some(Kind::Fin),
+            KIND_OK => Some(Kind::Ok),
+            KIND_FAIL => Some(Kind::Fail),
+            _ => None,
+        }
+    }
+
+    pub fn as_u8(self) -> u8 {
+        self as u8
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Payload {
     Hello { protocol_ver: u8, role: u8 },
@@ -64,15 +99,15 @@ pub fn data_chunk_size(version: u8) -> usize {
 
 fn kind_of(p: &Payload) -> u8 {
     match p {
-        Payload::Hello { .. } => KIND_HELLO,
-        Payload::Probe { .. } => KIND_PROBE,
-        Payload::Link { .. } => KIND_LINK,
-        Payload::Go { .. } => KIND_GO,
-        Payload::Data { .. } => KIND_DATA,
-        Payload::Ack { .. } => KIND_ACK,
-        Payload::Fin { .. } => KIND_FIN,
-        Payload::Ok => KIND_OK,
-        Payload::Fail { .. } => KIND_FAIL,
+        Payload::Hello { .. } => Kind::Hello.as_u8(),
+        Payload::Probe { .. } => Kind::Probe.as_u8(),
+        Payload::Link { .. } => Kind::Link.as_u8(),
+        Payload::Go { .. } => Kind::Go.as_u8(),
+        Payload::Data { .. } => Kind::Data.as_u8(),
+        Payload::Ack { .. } => Kind::Ack.as_u8(),
+        Payload::Fin { .. } => Kind::Fin.as_u8(),
+        Payload::Ok => Kind::Ok.as_u8(),
+        Payload::Fail { .. } => Kind::Fail.as_u8(),
     }
 }
 
