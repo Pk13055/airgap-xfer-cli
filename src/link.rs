@@ -175,6 +175,7 @@ pub fn run_recv_handshake(
 ) -> Result<Session> {
     let hello_deadline = Instant::now() + hello_timeout(cfg);
     let mut probes = Vec::new();
+    let saw_last;
 
     loop {
         if opt
@@ -199,9 +200,7 @@ pub fn run_recv_handshake(
                 last,
             })) => {
                 probes.push((id, qr_version, dwell_ms));
-                if last {
-                    break;
-                }
+                saw_last = last;
                 break;
             }
             Ok(_) => {}
@@ -213,32 +212,34 @@ pub fn run_recv_handshake(
         return Err(Error::NoUsableProbe);
     }
 
-    let quiet = quiet_timeout(cfg);
-    let mut quiet_deadline = Instant::now() + quiet;
-    let mut saw_last = false;
-    while !saw_last {
-        let Some(remaining) = quiet_deadline.checked_duration_since(Instant::now()) else {
-            break;
-        };
-        match opt.poll(remaining)? {
-            Some(Payload::Probe {
-                id,
-                qr_version,
-                dwell_ms,
-                last,
-            }) => {
-                probes.push((id, qr_version, dwell_ms));
-                quiet_deadline = Instant::now() + quiet;
-                saw_last = last;
+    if !saw_last {
+        let quiet = quiet_timeout(cfg);
+        let mut quiet_deadline = Instant::now() + quiet;
+        while !saw_last {
+            let Some(remaining) = quiet_deadline.checked_duration_since(Instant::now()) else {
+                break;
+            };
+            match opt.poll(remaining)? {
+                Some(Payload::Probe {
+                    id,
+                    qr_version,
+                    dwell_ms,
+                    last,
+                }) => {
+                    probes.push((id, qr_version, dwell_ms));
+                    quiet_deadline = Instant::now() + quiet;
+                    saw_last = last;
+                }
+                Some(_) => {}
+                None => break,
             }
-            Some(_) => {}
-            None => break,
         }
     }
 
     let successful_count = probes
         .iter()
         .map(|(id, _, _)| *id)
+        .filter(|id| PROBES.iter().any(|(probe_id, _, _)| id == probe_id))
         .collect::<HashSet<_>>()
         .len();
     let (_, qr_version, dwell_ms) = probes
@@ -300,8 +301,45 @@ pub fn run_recv_handshake(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::optical::pair;
+    use crate::optical::{pair, Optical};
     use std::thread;
+
+    struct LastProbeOptical {
+        poll_count: usize,
+        link_shown: bool,
+    }
+
+    impl Optical for LastProbeOptical {
+        fn show(&mut self, payload: &Payload) -> Result<()> {
+            if matches!(payload, Payload::Link { .. }) {
+                self.link_shown = true;
+            }
+            Ok(())
+        }
+
+        fn poll(&mut self, timeout: Duration) -> Result<Option<Payload>> {
+            self.poll_count += 1;
+            match self.poll_count {
+                1 => Ok(Some(Payload::Probe {
+                    id: 0,
+                    qr_version: 10,
+                    dwell_ms: 250,
+                    last: true,
+                })),
+                _ if self.link_shown => Ok(Some(Payload::Go {
+                    basename: "file".into(),
+                    uncompressed_hint: 0,
+                    compressed_size: 1,
+                    chunk_count: 1,
+                    sha256: [0; 32],
+                })),
+                _ => {
+                    thread::sleep(timeout);
+                    Ok(None)
+                }
+            }
+        }
+    }
 
     #[test]
     fn handshake_picks_highest_passing_probe() {
@@ -337,5 +375,20 @@ mod tests {
             err,
             crate::Error::HandshakeTimeout | crate::Error::NoUsableProbe
         ));
+    }
+
+    #[test]
+    fn receiver_skips_quiet_wait_after_last_probe() {
+        let mut opt = LastProbeOptical {
+            poll_count: 0,
+            link_shown: false,
+        };
+        let out = std::env::temp_dir().join(format!("ag-last-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&out);
+        std::fs::create_dir_all(&out).unwrap();
+
+        run_recv_handshake(&mut opt, &out, false, LinkConfig { fast: true }).unwrap();
+
+        assert_eq!(opt.poll_count, 2);
     }
 }
