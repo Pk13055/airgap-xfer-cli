@@ -177,20 +177,48 @@ pub fn recv_blob(
         return Err(Error::HandshakeFailed);
     }
     let chunk_count = session.chunk_count;
+    let compressed_size =
+        usize::try_from(session.compressed_size).map_err(|_| Error::HandshakeFailed)?;
+    if expected_chunk_count(compressed_size, chunk_size) != Some(chunk_count) {
+        return Err(Error::HandshakeFailed);
+    }
     let mut got = HashSet::new();
-    let mut parts = vec![None; chunk_count as usize];
+    let mut blob = vec![0; compressed_size];
     let mut base = 0;
 
     loop {
         match opt.poll(ack_timeout(cfg))? {
             Some(Payload::Data { seq, chunk }) => {
                 let end = (base + WINDOW).min(chunk_count);
-                if seq < base || seq >= end || got.contains(&seq) {
+                if seq < base {
+                    if got.contains(&seq) {
+                        let window_base = seq / WINDOW * WINDOW;
+                        let window_end = (window_base + WINDOW).min(chunk_count);
+                        let bitmap = (window_base..window_end).fold(0, |bits, candidate| {
+                            bits | if got.contains(&candidate) {
+                                1 << (candidate - window_base)
+                            } else {
+                                0
+                            }
+                        });
+                        opt.show(&Payload::Ack {
+                            window_base,
+                            bitmap,
+                        })?;
+                    }
+                    continue;
+                }
+                if seq >= end || got.contains(&seq) {
                     continue;
                 }
 
+                let start = seq as usize * chunk_size;
+                let expected_len = (compressed_size - start).min(chunk_size);
+                if chunk.len() != expected_len {
+                    return Err(Error::HandshakeFailed);
+                }
                 got.insert(seq);
-                parts[seq as usize] = Some(chunk);
+                blob[start..start + expected_len].copy_from_slice(&chunk);
                 let bitmap = (base..end).fold(0, |bits, candidate| {
                     bits | if got.contains(&candidate) {
                         1 << (candidate - base)
@@ -208,9 +236,8 @@ pub fn recv_blob(
                 }
             }
             Some(Payload::Fin { .. }) if got.len() == chunk_count as usize => {
-                let mut blob = Vec::with_capacity(session.compressed_size as usize);
-                for part in parts {
-                    blob.extend(part.expect("all chunk parts were received"));
+                if blob.len() != compressed_size {
+                    return Err(Error::HandshakeFailed);
                 }
                 let digest: [u8; 32] = Sha256::digest(&blob).into();
                 if digest != session.sha256 {
@@ -230,7 +257,33 @@ mod tests {
     use super::*;
     use crate::optical::{pair, Lossy};
     use sha2::{Digest, Sha256};
-    use std::thread;
+    use std::{thread, time::Duration};
+
+    struct DropOneCompleteAck<T> {
+        inner: T,
+        dropped: bool,
+    }
+
+    impl<T: Optical> Optical for DropOneCompleteAck<T> {
+        fn show(&mut self, payload: &Payload) -> Result<()> {
+            if matches!(
+                payload,
+                Payload::Ack {
+                    bitmap: u32::MAX,
+                    ..
+                }
+            ) && !self.dropped
+            {
+                self.dropped = true;
+                return Ok(());
+            }
+            self.inner.show(payload)
+        }
+
+        fn poll(&mut self, timeout: Duration) -> Result<Option<Payload>> {
+            self.inner.poll(timeout)
+        }
+    }
 
     fn session_for(blob: &[u8], version: u8) -> Session {
         let cs = data_chunk_size(version);
@@ -303,6 +356,65 @@ mod tests {
         let rt = thread::spawn(move || recv_blob(&mut r, &sess, cfg).unwrap());
         st.join().unwrap();
         assert_eq!(rt.join().unwrap(), blob);
+    }
+
+    #[test]
+    fn transfer_crosses_ack_window_boundary() {
+        let blob: Vec<u8> = (0..6401u32).map(|i| i as u8).collect();
+        let sess = session_for(&blob, 10);
+        assert!(sess.chunk_count > WINDOW);
+        let (mut s, mut r) = pair();
+        let cfg = TransportConfig { fast: true };
+        let st = thread::spawn({
+            let blob = blob.clone();
+            let sess = sess.clone();
+            move || send_blob(&mut s, &sess, &blob, cfg).unwrap()
+        });
+        let rt = thread::spawn(move || recv_blob(&mut r, &sess, cfg).unwrap());
+        st.join().unwrap();
+        assert_eq!(rt.join().unwrap(), blob);
+    }
+
+    #[test]
+    fn transfer_recovers_when_completed_window_ack_is_lost() {
+        let blob: Vec<u8> = (0..6401u32).map(|i| i as u8).collect();
+        let sess = session_for(&blob, 10);
+        let (mut s, r) = pair();
+        let mut r = DropOneCompleteAck {
+            inner: r,
+            dropped: false,
+        };
+        let cfg = TransportConfig { fast: true };
+        let st = thread::spawn({
+            let blob = blob.clone();
+            let sess = sess.clone();
+            move || send_blob(&mut s, &sess, &blob, cfg).unwrap()
+        });
+        let rt = thread::spawn(move || recv_blob(&mut r, &sess, cfg).unwrap());
+        st.join().unwrap();
+        assert_eq!(rt.join().unwrap(), blob);
+    }
+
+    #[test]
+    fn recv_rejects_wrong_sized_data_chunk() {
+        let blob = vec![1; 159];
+        let mut sess = session_for(&blob, 10);
+        sess.compressed_size = 160;
+        let (mut s, mut r) = pair();
+        s.show(&Payload::Data {
+            seq: 0,
+            chunk: blob,
+        })
+        .unwrap();
+        s.show(&Payload::Fin {
+            sha256: sess.sha256,
+        })
+        .unwrap();
+
+        assert!(matches!(
+            recv_blob(&mut r, &sess, TransportConfig { fast: true }),
+            Err(Error::HandshakeFailed)
+        ));
     }
 
     #[test]
