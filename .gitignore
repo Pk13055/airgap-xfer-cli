@@ -1,3 +1,5 @@
 /target
-/bin
+/bin/*
+!/bin/airgap-xfer
+!/bin/airgap-xfer.exe
 .DS_Store
