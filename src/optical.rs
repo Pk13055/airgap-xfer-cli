@@ -1,0 +1,120 @@
+use crate::{
+    frame::{decode, encode, Payload},
+    Error, Result,
+};
+use std::{
+    collections::HashSet,
+    sync::mpsc::{self, Receiver, Sender},
+    time::Duration,
+};
+
+pub trait Optical {
+    fn show(&mut self, payload: &Payload) -> Result<()>;
+    fn poll(&mut self, timeout: Duration) -> Result<Option<Payload>>;
+}
+
+pub struct PairEnd {
+    sender: Sender<Vec<u8>>,
+    receiver: Receiver<Vec<u8>>,
+}
+
+pub fn pair() -> (PairEnd, PairEnd) {
+    let (a_to_b_sender, a_to_b_receiver) = mpsc::channel();
+    let (b_to_a_sender, b_to_a_receiver) = mpsc::channel();
+
+    (
+        PairEnd {
+            sender: a_to_b_sender,
+            receiver: b_to_a_receiver,
+        },
+        PairEnd {
+            sender: b_to_a_sender,
+            receiver: a_to_b_receiver,
+        },
+    )
+}
+
+impl Optical for PairEnd {
+    fn show(&mut self, payload: &Payload) -> Result<()> {
+        let frame = encode(payload)?;
+        self.sender
+            .send(frame)
+            .map_err(|_| Error::Message("optical peer disconnected".into()))
+    }
+
+    fn poll(&mut self, timeout: Duration) -> Result<Option<Payload>> {
+        match self.receiver.recv_timeout(timeout) {
+            Ok(frame) => decode(&frame).map(Some),
+            Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                Err(Error::Message("optical peer disconnected".into()))
+            }
+        }
+    }
+}
+
+pub struct Lossy<T> {
+    pub inner: T,
+    pub drop_data_seq: HashSet<u32>,
+}
+
+impl<T: Optical> Optical for Lossy<T> {
+    fn show(&mut self, payload: &Payload) -> Result<()> {
+        self.inner.show(payload)
+    }
+
+    fn poll(&mut self, timeout: Duration) -> Result<Option<Payload>> {
+        let payload = self.inner.poll(timeout)?;
+        if let Some(Payload::Data { seq, .. }) = payload.as_ref() {
+            if self.drop_data_seq.remove(seq) {
+                return Ok(None);
+            }
+        }
+        Ok(payload)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::frame::Payload;
+    use std::time::Duration;
+
+    #[test]
+    fn pair_delivers_hello() {
+        let (mut a, mut b) = pair();
+        a.show(&Payload::Hello {
+            protocol_ver: 1,
+            role: 2,
+        })
+        .unwrap();
+        match b.poll(Duration::from_millis(1)).unwrap() {
+            Some(Payload::Hello { role, .. }) => assert_eq!(role, 2),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn lossy_drops_configured_data_seq() {
+        let (mut send, recv) = pair();
+        let mut recv = Lossy {
+            inner: recv,
+            drop_data_seq: [3].into_iter().collect(),
+        };
+        send.show(&Payload::Data {
+            seq: 3,
+            chunk: vec![1],
+        })
+        .unwrap();
+        assert!(recv.poll(Duration::from_millis(1)).unwrap().is_none());
+        send.show(&Payload::Data {
+            seq: 4,
+            chunk: vec![2],
+        })
+        .unwrap();
+        match recv.poll(Duration::from_millis(1)).unwrap() {
+            Some(Payload::Data { seq, .. }) => assert_eq!(seq, 4),
+            other => panic!("{other:?}"),
+        }
+    }
+}
