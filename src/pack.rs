@@ -155,12 +155,7 @@ pub fn unpack(zst: &Path, outdir: &Path, force: bool) -> Result<PathBuf> {
         let mut archive = tar::Archive::new(decoder);
         archive.unpack(&partial)?;
 
-        let basename = partial
-            .read_dir()?
-            .filter_map(|entry| entry.ok())
-            .find(|entry| entry.file_name() != ".airgap-xfer-partial")
-            .map(|entry| entry.file_name().to_string_lossy().into_owned())
-            .ok_or_else(|| Error::Message("archive has no root entry".into()))?;
+        let basename = archive_root_basename(&partial)?;
         let source = partial.join(&basename);
         let destination = outdir.join(&basename);
 
@@ -181,6 +176,26 @@ pub fn unpack(zst: &Path, outdir: &Path, force: bool) -> Result<PathBuf> {
         let _ = remove_path_if_exists(&partial);
     }
     result
+}
+
+fn archive_root_basename(partial: &Path) -> Result<String> {
+    let mut roots = Vec::new();
+    for entry in fs::read_dir(partial)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name != "." && name != ".." {
+            roots.push(name);
+        }
+    }
+
+    if roots.len() != 1 {
+        return Err(Error::Message(format!(
+            "bad archive: expected exactly one top-level entry, found {}",
+            roots.len()
+        )));
+    }
+
+    Ok(roots.pop().unwrap().to_string_lossy().into_owned())
 }
 
 pub fn remove_temp(path: &Path) {
@@ -292,6 +307,38 @@ mod tests {
         assert!(matches!(err, crate::Error::DestExists(_)));
         unpack(&packed.temp_path, &out, true).unwrap();
         remove_temp(&packed.temp_path);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rejects_archive_with_multiple_top_level_entries_without_torn_destination() {
+        let root = std::env::temp_dir().join(format!("ag-pack-multiple-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let archive_path = root.join("multiple-roots.tar.zst");
+        let file = File::create(&archive_path).unwrap();
+        let encoder = zstd::Encoder::new(file, 3).unwrap();
+        let mut archive = tar::Builder::new(encoder);
+        for (path, contents) in [("alpha", b"new" as &[u8]), ("beta", b"other")] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(contents.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive.append_data(&mut header, path, contents).unwrap();
+        }
+        archive.finish().unwrap();
+        archive.into_inner().unwrap().finish().unwrap();
+
+        let out = root.join("out");
+        write(&out.join("alpha"), b"old");
+        let err = unpack(&archive_path, &out, true).unwrap_err();
+
+        assert!(matches!(err, Error::Message(message) if message.contains("bad archive")));
+        assert_eq!(fs::read(out.join("alpha")).unwrap(), b"old");
+        assert!(!out.join("beta").exists());
+        assert!(!out.join(".airgap-xfer-partial").exists());
+
         let _ = fs::remove_dir_all(&root);
     }
 }
