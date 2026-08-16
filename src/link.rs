@@ -175,7 +175,7 @@ pub fn run_recv_handshake(
 ) -> Result<Session> {
     let hello_deadline = Instant::now() + hello_timeout(cfg);
     let mut probes = Vec::new();
-    let saw_last;
+    let mut saw_last;
 
     loop {
         if opt
