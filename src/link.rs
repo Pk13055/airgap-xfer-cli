@@ -236,10 +236,10 @@ pub fn run_recv_handshake(
         }
     }
 
+    probes.retain(|(id, _, _)| PROBES.iter().any(|(probe_id, _, _)| id == probe_id));
     let successful_count = probes
         .iter()
         .map(|(id, _, _)| *id)
-        .filter(|id| PROBES.iter().any(|(probe_id, _, _)| id == probe_id))
         .collect::<HashSet<_>>()
         .len();
     let (_, qr_version, dwell_ms) = probes
@@ -375,6 +375,37 @@ mod tests {
             err,
             crate::Error::HandshakeTimeout | crate::Error::NoUsableProbe
         ));
+    }
+
+    #[test]
+    fn receiver_rejects_only_unknown_probe() {
+        struct UnknownProbeOptical;
+
+        impl Optical for UnknownProbeOptical {
+            fn show(&mut self, _: &Payload) -> Result<()> {
+                Ok(())
+            }
+
+            fn poll(&mut self, _: Duration) -> Result<Option<Payload>> {
+                Ok(Some(Payload::Probe {
+                    id: 99,
+                    qr_version: 40,
+                    dwell_ms: 150,
+                    last: true,
+                }))
+            }
+        }
+
+        let mut opt = UnknownProbeOptical;
+        let err = run_recv_handshake(
+            &mut opt,
+            &std::env::temp_dir(),
+            false,
+            LinkConfig { fast: true },
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, Error::NoUsableProbe));
     }
 
     #[test]
