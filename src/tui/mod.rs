@@ -366,7 +366,11 @@ fn event_loop<B: ratatui::backend::Backend>(
 
         if dirty || last_draw.elapsed() >= Duration::from_millis(80) {
             let preview = feed.preview();
-            terminal.draw(|frame| draw(frame, &ui, preview.as_deref(), feed.counters()))?;
+            let status = FeedStatus {
+                counters: feed.counters(),
+                locked: feed.locked(),
+            };
+            terminal.draw(|frame| draw(frame, &ui, preview.as_deref(), status))?;
             last_draw = Instant::now();
         }
         if let Some(ack) = pending_draw_ack {
@@ -378,11 +382,18 @@ fn event_loop<B: ratatui::backend::Backend>(
     }
 }
 
+/// What the camera thread has to say about itself, for the title line.
+#[derive(Clone, Copy)]
+struct FeedStatus {
+    counters: (u64, u64),
+    locked: bool,
+}
+
 fn draw(
     frame: &mut ratatui::Frame,
     ui: &Ui,
     preview: Option<&GrayImage>,
-    counters: (u64, u64),
+    status: FeedStatus,
 ) {
     let area = frame.area();
     let (qr_cols, qr_rows) = qr::cell_size_for_version(ui.max_version);
@@ -401,7 +412,7 @@ fn draw(
 
     // The title line always carries what is on screen, because the QR block's
     // own title disappears with its border on a short terminal.
-    let (frames, decodes) = counters;
+    let (frames, decodes) = status.counters;
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(
@@ -411,9 +422,16 @@ fn draw(
                     .bg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             ),
+            Span::raw(format!("  cam {}  ·  ", ui.camera_index)),
+            // Whether the peer's screen has been located is the single most
+            // useful thing to know while aiming a laptop lid.
+            if status.locked {
+                Span::styled("● tracking", Style::new().fg(Color::Green))
+            } else {
+                Span::styled("○ searching", Style::new().fg(Color::Yellow))
+            },
             Span::raw(format!(
-                "  cam {}  ·  {frames} frames  ·  {decodes} decodes{}",
-                ui.camera_index,
+                "  ·  {frames} frames  ·  {decodes} decodes{}",
                 if ui.label.is_empty() {
                     String::new()
                 } else {

@@ -14,7 +14,7 @@ use nokhwa::{
     Camera,
 };
 
-use crate::{frame::Payload, live::camera_error, qr, Error, Result};
+use crate::{detect::Tracker, frame::Payload, live::camera_error, Error, Result};
 
 /// Width of the downscaled copy kept for the on-screen preview. Cloning full
 /// 1080p luma frames into the UI thread every tick would cost megabytes a
@@ -31,6 +31,8 @@ struct Shared {
     frames: AtomicU64,
     preview: Mutex<Option<Arc<GrayImage>>>,
     failure: Mutex<Option<String>>,
+    /// Whether the peer's screen is currently being tracked in the frame.
+    locked: AtomicBool,
     stop: AtomicBool,
 }
 
@@ -113,6 +115,12 @@ impl CameraFeed {
             self.shared.decodes.load(Ordering::Relaxed),
         )
     }
+
+    /// Whether the peer's code has been located in the frame and is being
+    /// followed, rather than hunted for from scratch each frame.
+    pub fn locked(&self) -> bool {
+        self.shared.locked.load(Ordering::Relaxed)
+    }
 }
 
 impl Drop for CameraFeed {
@@ -130,6 +138,10 @@ fn capture_loop(index: u32, shared: &Shared) -> Result<()> {
     camera.open_stream().map_err(camera_error)?;
 
     let mut seq = 0u64;
+    // The lids sit at different angles, so the peer's screen is a small
+    // trapezoid somewhere in a wide frame. The tracker finds it once and then
+    // decodes rectified crops of that region.
+    let mut tracker = Tracker::new();
     while !shared.stop.load(Ordering::SeqCst) {
         let buffer = camera.frame().map_err(camera_error)?;
         let Ok(gray) = buffer.decode_image::<LumaFormat>() else {
@@ -141,7 +153,9 @@ fn capture_loop(index: u32, shared: &Shared) -> Result<()> {
             *slot = Some(Arc::new(downscale(&gray)));
         }
 
-        let Ok(bytes) = qr::decode_image(&gray) else {
+        let decoded = tracker.decode(&gray);
+        shared.locked.store(tracker.locked(), Ordering::Relaxed);
+        let Some(bytes) = decoded else {
             continue;
         };
         let Ok(payload) = crate::frame::decode(&bytes) else {

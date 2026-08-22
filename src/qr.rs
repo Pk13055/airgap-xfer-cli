@@ -88,16 +88,39 @@ pub fn modules_of(img: &GrayImage) -> usize {
     img.width() as usize / MODULE_SCALE
 }
 
-/// Decodes a QR code image, preserving its binary payload.
-pub fn decode_image(img: &GrayImage) -> Result<Vec<u8>> {
-    rxing::helpers::detect_in_luma(
+/// A decoded payload and the points at which the decoder found the code.
+pub type Decoded = (Vec<u8>, Vec<(f32, f32)>);
+
+/// Decodes a QR code image, preserving its binary payload, and reports where
+/// the decoder found it.
+///
+/// Deliberately calls `detect_in_luma_with_hints` rather than the shorter
+/// `detect_in_luma`: as of rxing 0.7.1 the latter forwards its `width` and
+/// `height` arguments to the luminance source in the wrong order, so every
+/// non-square image — which is to say every camera frame — is interpreted
+/// transposed and nothing decodes. Both paths default `TryHarder` on, so
+/// nothing is lost by going the long way round.
+pub fn decode_with_points(img: &GrayImage) -> Result<Decoded> {
+    let result = rxing::helpers::detect_in_luma_with_hints(
         img.as_raw().clone(),
         img.width(),
         img.height(),
         Some(rxing::BarcodeFormat::QR_CODE),
+        &mut rxing::DecodeHints::default(),
     )
-    .map(|result| result.getRawBytes().to_vec())
-    .map_err(|_| Error::BadFrame)
+    .map_err(|_| Error::BadFrame)?;
+
+    let points = result
+        .getPoints()
+        .iter()
+        .map(|point| (point.x, point.y))
+        .collect();
+    Ok((result.getRawBytes().to_vec(), points))
+}
+
+/// Decodes a QR code image, preserving its binary payload.
+pub fn decode_image(img: &GrayImage) -> Result<Vec<u8>> {
+    decode_with_points(img).map(|(bytes, _)| bytes)
 }
 
 /// Renders two QR modules per terminal row using Unicode block characters.
@@ -176,6 +199,33 @@ mod tests {
         assert_eq!(max_version_for_area(cols, rows - 1), None);
         let (big_cols, big_rows) = cell_size_for_version(20);
         assert_eq!(max_version_for_area(big_cols, big_rows), Some(20));
+    }
+
+    #[test]
+    fn a_code_in_a_wide_frame_decodes_like_the_camera_sees_it() {
+        // Regression: rxing's `detect_in_luma` swaps width and height, so a
+        // square test image round-trips happily while every 1920x1080 camera
+        // frame is read transposed and decodes as nothing.
+        let payload = frame::encode(&frame::Payload::Ok).unwrap();
+        let code = encode_version(&payload, 10).unwrap();
+        let mut canvas = image::GrayImage::from_pixel(1920, 1080, Luma([255]));
+        for y in 0..code.height() {
+            for x in 0..code.width() {
+                canvas.put_pixel(700 + x, 400 + y, *code.get_pixel(x, y));
+            }
+        }
+        assert_eq!(decode_image(&canvas).unwrap(), payload);
+    }
+
+    #[test]
+    fn decoding_reports_where_the_code_was_found() {
+        let code = encode_version(b"AX-points", 10).unwrap();
+        let (_, points) = decode_with_points(&code).unwrap();
+        assert!(points.len() >= 3, "expected a locatable quad, got {points:?}");
+        for (x, y) in points {
+            assert!(x >= 0.0 && x <= code.width() as f32, "{x}");
+            assert!(y >= 0.0 && y <= code.height() as f32, "{y}");
+        }
     }
 
     #[test]
