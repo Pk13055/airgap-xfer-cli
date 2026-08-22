@@ -4,11 +4,11 @@ use std::path::PathBuf;
 
 use crate::{
     frame,
-    link::{self, LinkConfig},
+    link,
     live,
     optical::Optical,
     pack,
-    transport::{self, TransportConfig},
+    session,
     tui,
 };
 
@@ -87,6 +87,8 @@ fn is_interrupted(result: &crate::Result<()>) -> bool {
     matches!(result, Err(crate::Error::Interrupted))
 }
 
+/// Announces the settings an attempt will use, so the operator can see the
+/// ladder being walked down rather than just watching it hang.
 fn send(path: PathBuf, camera: u32, keep_temp: bool, no_invert: bool) -> crate::Result<()> {
     let mut packed = pack::pack(&path)?;
     if !keep_temp {
@@ -98,18 +100,21 @@ fn send(path: PathBuf, camera: u32, keep_temp: bool, no_invert: bool) -> crate::
     let title = format!("airgap-xfer · SEND {}", packed.basename);
     let result = tui::run(&title, camera, no_invert, move |mut opt, max_version| {
         let blob = fs::read(&packed.temp_path)?;
-        let session = link::run_send_handshake(
+        let done = session::send_with_fallback(
             &mut opt,
-            packed.basename.clone(),
+            &packed.basename,
             packed.uncompressed_hint,
             &blob,
             packed.sha256,
-            LinkConfig::gated(max_version),
+            max_version,
         )?;
-        transport::send_blob(&mut opt, &session, &blob, TransportConfig::gated())?;
         Ok(format!(
-            "sent {} ({} B in {} chunks at QR v{})",
-            session.basename, session.compressed_size, session.chunk_count, session.qr_version
+            "sent {} ({} B in {} chunks at QR v{}{})",
+            done.session.basename,
+            done.session.compressed_size,
+            done.session.chunk_count,
+            done.session.qr_version,
+            attempt_note(done.attempt)
         ))
     });
 
@@ -123,6 +128,16 @@ fn send(path: PathBuf, camera: u32, keep_temp: bool, no_invert: bool) -> crate::
     result
 }
 
+/// Mentions which rung of the fallback ladder finally worked, and says nothing
+/// when the first attempt did.
+fn attempt_note(attempt: usize) -> String {
+    if attempt == 0 {
+        String::new()
+    } else {
+        format!(", attempt {}/{}", attempt + 1, link::MAX_ATTEMPTS)
+    }
+}
+
 fn recv(
     outdir: PathBuf,
     camera: u32,
@@ -132,9 +147,8 @@ fn recv(
 ) -> crate::Result<()> {
     let title = format!("airgap-xfer · RECV into {}", outdir.display());
     tui::run(&title, camera, no_invert, move |mut opt, max_version| {
-        let session =
-            link::run_recv_handshake(&mut opt, &outdir, force, LinkConfig::gated(max_version))?;
-        let blob = transport::recv_blob(&mut opt, &session, TransportConfig::gated())?;
+        let (done, blob) =
+            session::recv_with_fallback(&mut opt, &outdir, force, max_version)?;
 
         // recv_blob only verifies the hash; it deliberately does not send OK.
         // The sender must not see OK until the blob is durably written (and
@@ -182,9 +196,10 @@ fn recv(
         }
         write_and_unpack?;
         Ok(format!(
-            "received {} into {}",
-            session.basename,
-            outdir.display()
+            "received {} into {}{}",
+            done.session.basename,
+            outdir.display(),
+            attempt_note(done.attempt)
         ))
     })
 }

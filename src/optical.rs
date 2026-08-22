@@ -24,6 +24,18 @@ pub trait Optical {
     /// No-op by default.
     fn log(&mut self, _line: &str) {}
 
+    /// How long this side needs each code held on screen, in milliseconds,
+    /// based on how often its camera actually lands a decode.
+    ///
+    /// The probe table's dwells assume a camera that resolves a code within a
+    /// couple of frames. A real webcam decoding 1080p does far worse, and a
+    /// code that goes by in fewer frames than that is simply missed — which
+    /// arrives as a hole in the window rather than as anything diagnosable.
+    /// Zero means "no opinion".
+    fn suggested_dwell_ms(&mut self) -> u16 {
+        0
+    }
+
     /// Blocks until the operator confirms the upcoming phase described by
     /// `prompt`, returning `Ok(true)` to proceed and `Ok(false)` to abort.
     ///

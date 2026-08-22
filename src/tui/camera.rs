@@ -29,6 +29,9 @@ struct Shared {
     decoded: Mutex<Option<(u64, Payload)>>,
     decodes: AtomicU64,
     frames: AtomicU64,
+    /// Exponential moving average of the gap between successful decodes, in
+    /// milliseconds. Zero until at least two decodes have landed.
+    decode_gap_ms: AtomicU64,
     preview: Mutex<Option<Arc<GrayImage>>>,
     failure: Mutex<Option<String>>,
     /// Whether the peer's screen is currently being tracked in the frame.
@@ -121,6 +124,15 @@ impl CameraFeed {
     pub fn locked(&self) -> bool {
         self.shared.locked.load(Ordering::Relaxed)
     }
+
+    /// Typical milliseconds between successful decodes, or `None` before
+    /// enough have landed to say.
+    pub fn decode_gap_ms(&self) -> Option<u64> {
+        match self.shared.decode_gap_ms.load(Ordering::Relaxed) {
+            0 => None,
+            gap => Some(gap),
+        }
+    }
 }
 
 impl Drop for CameraFeed {
@@ -138,6 +150,7 @@ fn capture_loop(index: u32, shared: &Shared) -> Result<()> {
     camera.open_stream().map_err(camera_error)?;
 
     let mut seq = 0u64;
+    let mut last_decode: Option<std::time::Instant> = None;
     // The lids sit at different angles, so the peer's screen is a small
     // trapezoid somewhere in a wide frame. The tracker finds it once and then
     // decodes rectified crops of that region.
@@ -163,6 +176,16 @@ fn capture_loop(index: u32, shared: &Shared) -> Result<()> {
         };
         seq += 1;
         shared.decodes.fetch_add(1, Ordering::Relaxed);
+        let now = std::time::Instant::now();
+        if let Some(previous) = last_decode.replace(now) {
+            let gap = now.duration_since(previous).as_millis() as u64;
+            let smoothed = match shared.decode_gap_ms.load(Ordering::Relaxed) {
+                0 => gap,
+                // Weighted toward history so one slow frame does not swing it.
+                current => (current * 3 + gap) / 4,
+            };
+            shared.decode_gap_ms.store(smoothed.max(1), Ordering::Relaxed);
+        }
         if let Ok(mut slot) = shared.decoded.lock() {
             *slot = Some((seq, payload));
         }

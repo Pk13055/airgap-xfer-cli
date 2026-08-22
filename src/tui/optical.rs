@@ -21,6 +21,13 @@ use crate::{
 /// How long the protocol thread sleeps between checks of the camera's latest
 /// decode. Short enough that a 150 ms probe dwell is never missed.
 const POLL_TICK: Duration = Duration::from_millis(5);
+/// Decode attempts each displayed code should get. One would mean every missed
+/// frame is a lost chunk; three leaves room for glare, focus hunting, and the
+/// occasional dropped frame.
+const DECODE_ATTEMPTS_PER_CODE: u64 = 3;
+/// Bounds on the dwell we will ask the sender for.
+const MIN_SUGGESTED_DWELL_MS: u64 = 120;
+const MAX_SUGGESTED_DWELL_MS: u64 = 1200;
 
 /// What the operator chose at a turn boundary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -148,6 +155,14 @@ impl Optical for TuiOptical {
 
     fn log(&mut self, line: &str) {
         let _ = self.send(UiEvent::Log(line.to_string()));
+    }
+
+    fn suggested_dwell_ms(&mut self) -> u16 {
+        let Some(gap) = self.camera.decode_gap_ms() else {
+            return 0;
+        };
+        (gap * DECODE_ATTEMPTS_PER_CODE)
+            .clamp(MIN_SUGGESTED_DWELL_MS, MAX_SUGGESTED_DWELL_MS) as u16
     }
 
     fn gate(&mut self, prompt: &str) -> Result<bool> {

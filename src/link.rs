@@ -27,14 +27,21 @@ pub struct LinkConfig {
     /// Shortens HELLO/LINK/GO timeouts to 100/50/50 ms, quiet time to 20 ms,
     /// and skips probe dwell sleeps.
     pub fast: bool,
-    /// Pauses at each phase boundary for an operator confirmation and
-    /// stretches the HELLO/LINK/GO timeouts to [`GATED_TIMEOUT`] so the peer
-    /// keeps waiting while a human reads the screen and presses Enter.
-    pub gated: bool,
+    /// Pauses at each phase boundary for an operator confirmation.
+    pub gates: bool,
+    /// Stretches the HELLO/LINK/GO timeouts to [`GATED_TIMEOUT`]. Set whenever
+    /// the peer might be slow to arrive — a human reading the screen, or a
+    /// stalled peer still working through its own retry — which is every
+    /// interactive path, gated or not.
+    pub patient: bool,
     /// Highest QR version this side can display without clipping. Probes above
     /// it are never offered, and never chosen from the other peer's offers: a
     /// clipped code is undecodable.
     pub max_qr_version: u8,
+    /// Lower bound on how long each code stays on screen, overriding the probe
+    /// table. Raised on retries: the receiver's camera needs several frames per
+    /// displayed code to have a fair chance at every one of them.
+    pub dwell_floor_ms: u16,
 }
 
 /// Timeout used for peer replies when a human sits between the phases.
@@ -44,8 +51,10 @@ impl Default for LinkConfig {
     fn default() -> Self {
         Self {
             fast: false,
-            gated: false,
+            gates: false,
+            patient: false,
             max_qr_version: 40,
+            dwell_floor_ms: 0,
         }
     }
 }
@@ -62,20 +71,86 @@ impl LinkConfig {
     /// Turn-based gates on top of another config, keeping its timeouts.
     pub fn with_gates(self) -> Self {
         Self {
-            gated: true,
+            gates: true,
             ..self
         }
     }
 
-    /// Interactive settings: turn-based gates, generous timeouts, and QR
-    /// versions capped to what this terminal can draw.
+    /// The first, interactive attempt: turn-based gates, generous timeouts,
+    /// and QR versions capped to what this terminal can draw.
     pub fn gated(max_qr_version: u8) -> Self {
         Self {
-            fast: false,
-            gated: true,
+            gates: true,
+            patient: true,
             max_qr_version,
+            ..Self::default()
         }
     }
+
+    /// A retry: same generous timeouts, but no prompts. Once the operator has
+    /// committed to the transfer, asking them to re-confirm every rung of the
+    /// fallback ladder would defeat the point of retrying automatically.
+    pub fn retry(plan: Attempt) -> Self {
+        Self {
+            patient: true,
+            max_qr_version: plan.max_qr_version,
+            dwell_floor_ms: plan.dwell_floor_ms,
+            ..Self::default()
+        }
+    }
+}
+
+/// How many times a stalled transfer is retried before giving up.
+pub const MAX_ATTEMPTS: usize = 10;
+/// Ceiling on the per-code dwell the ladder will climb to.
+const MAX_DWELL_MS: u16 = 1500;
+
+/// The optical settings to try on a given attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Attempt {
+    pub max_qr_version: u8,
+    pub dwell_floor_ms: u16,
+}
+
+/// Settings for attempt `n`, each rung trading throughput for legibility.
+///
+/// Missing sequence numbers mean the receiver's camera did not get a readable
+/// look at every code, so both levers point the same way: a smaller QR version
+/// (fewer, larger modules) held on screen for longer (more camera frames per
+/// code). The version steps down one rung per attempt until it bottoms out at
+/// the smallest usable one; after that only the dwell keeps growing.
+pub fn attempt_plan(attempt: usize, terminal_max: u8) -> Attempt {
+    let rungs: Vec<u8> = crate::qr::SUPPORTED_VERSIONS
+        .iter()
+        .copied()
+        .filter(|version| *version <= terminal_max)
+        .collect();
+    let top = rungs.len().saturating_sub(1);
+    Attempt {
+        max_qr_version: rungs
+            .get(top.saturating_sub(attempt))
+            .copied()
+            .unwrap_or_else(crate::qr::smallest_version),
+        dwell_floor_ms: if attempt == 0 {
+            0
+        } else {
+            (150 * (attempt as u16 + 1)).min(MAX_DWELL_MS)
+        },
+    }
+}
+
+/// Whether `err` is the kind of failure another, more conservative attempt
+/// could plausibly fix — as opposed to one that will fail identically forever.
+pub fn is_retryable(err: &Error) -> bool {
+    matches!(
+        err,
+        Error::Stalled(_)
+            | Error::HandshakeTimeout
+            | Error::HandshakeFailed
+            | Error::NoUsableProbe
+            | Error::BadFrame
+            | Error::HashMismatch
+    )
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -90,11 +165,12 @@ pub struct Session {
 }
 
 fn hello_timeout(cfg: LinkConfig) -> Duration {
-    // `fast` is the test knob and wins: gated timeouts are minutes long
-    // because a human is in the loop, which no test wants to wait for.
+    // `fast` is the test knob and wins: patient timeouts are minutes long
+    // because a human (or a peer working through its own retry) is in the
+    // loop, which no test wants to wait for.
     if cfg.fast {
         Duration::from_millis(100)
-    } else if cfg.gated {
+    } else if cfg.patient {
         GATED_TIMEOUT
     } else {
         Duration::from_secs(30)
@@ -102,11 +178,9 @@ fn hello_timeout(cfg: LinkConfig) -> Duration {
 }
 
 fn link_timeout(cfg: LinkConfig) -> Duration {
-    // `fast` is the test knob and wins: gated timeouts are minutes long
-    // because a human is in the loop, which no test wants to wait for.
     if cfg.fast {
         Duration::from_millis(50)
-    } else if cfg.gated {
+    } else if cfg.patient {
         GATED_TIMEOUT
     } else {
         Duration::from_secs(5)
@@ -114,11 +188,9 @@ fn link_timeout(cfg: LinkConfig) -> Duration {
 }
 
 fn go_timeout(cfg: LinkConfig) -> Duration {
-    // `fast` is the test knob and wins: gated timeouts are minutes long
-    // because a human is in the loop, which no test wants to wait for.
     if cfg.fast {
         Duration::from_millis(50)
-    } else if cfg.gated {
+    } else if cfg.patient {
         GATED_TIMEOUT
     } else {
         Duration::from_secs(15)
@@ -170,7 +242,7 @@ pub fn run_send_handshake(
         return Err(Error::HandshakeTimeout);
     }
     opt.log("receiver said HELLO");
-    if !opt.gate("Receiver found. Enter to run link probes")? {
+    if cfg.gates && !opt.gate("Receiver found. Enter to run link probes")? {
         return Err(Error::Aborted);
     }
 
@@ -196,7 +268,7 @@ pub fn run_send_handshake(
         }
     }
 
-    let Some((qr_version, dwell_ms)) =
+    let Some((qr_version, linked_dwell_ms)) =
         poll_until(opt, link_timeout(cfg), |payload| match payload {
             Payload::Link {
                 qr_version,
@@ -208,6 +280,7 @@ pub fn run_send_handshake(
     else {
         return Err(Error::HandshakeFailed);
     };
+    let dwell_ms = linked_dwell_ms.max(cfg.dwell_floor_ms);
 
     if qr_version > cfg.max_qr_version {
         return Err(Error::NoUsableProbe);
@@ -219,7 +292,7 @@ pub fn run_send_handshake(
     opt.log(&format!(
         "linked at QR v{qr_version}, {dwell_ms} ms dwell"
     ));
-    if !opt.gate(&format!("Linked at QR v{qr_version}. Enter to offer the file"))? {
+    if cfg.gates && !opt.gate(&format!("Linked at QR v{qr_version}. Enter to offer the file"))? {
         return Err(Error::Aborted);
     }
 
@@ -355,11 +428,17 @@ pub fn run_recv_handshake(
         .map(|(id, _, _)| *id)
         .collect::<HashSet<_>>()
         .len();
-    let (_, qr_version, dwell_ms) = probes
+    let (_, qr_version, probe_dwell_ms) = probes
         .iter()
         .copied()
         .max_by_key(|(_, qr_version, _)| *qr_version)
         .ok_or(Error::NoUsableProbe)?;
+    // The receiver owns the dwell: it is the side that knows how often its
+    // camera actually lands a decode, and LINK carries the number to the
+    // sender.
+    let dwell_ms = probe_dwell_ms
+        .max(cfg.dwell_floor_ms)
+        .max(opt.suggested_dwell_ms());
 
     // Loss is measured only against probes that could have counted: ones the
     // sender actually offered *and* this terminal is large enough to draw.
@@ -376,9 +455,11 @@ pub fn run_recv_handshake(
     opt.log(&format!(
         "sender found: best readable QR v{qr_version}, {probe_loss}% probe loss"
     ));
-    if !opt.gate(&format!(
-        "Sender found at QR v{qr_version} ({probe_loss}% probe loss). Enter to accept the link"
-    ))? {
+    if cfg.gates
+        && !opt.gate(&format!(
+            "Sender found at QR v{qr_version} ({probe_loss}% probe loss). Enter to accept the link"
+        ))?
+    {
         return Err(Error::Aborted);
     }
 
@@ -419,10 +500,12 @@ pub fn run_recv_handshake(
     opt.log(&format!(
         "offer: {basename}, {compressed_size} B compressed, {chunk_count} chunks"
     ));
-    if !opt.gate(&format!(
-        "Incoming {basename} ({compressed_size} B, {chunk_count} chunks) into {}. Enter to accept",
-        outdir.display()
-    ))? {
+    if cfg.gates
+        && !opt.gate(&format!(
+            "Incoming {basename} ({compressed_size} B, {chunk_count} chunks) into {}. Enter to accept",
+            outdir.display()
+        ))?
+    {
         opt.show(&Payload::Fail {
             reason: FAIL_ABORTED,
         })?;
@@ -543,6 +626,77 @@ mod tests {
         out
     }
 
+    /// A receiver whose camera is slow enough that the probe table's dwell
+    /// would give each code only one look.
+    struct SlowCamera<T> {
+        inner: T,
+        suggest_ms: u16,
+    }
+
+    impl<T: Optical> Optical for SlowCamera<T> {
+        fn show(&mut self, payload: &Payload) -> Result<()> {
+            self.inner.show(payload)
+        }
+
+        fn poll(&mut self, timeout: Duration) -> Result<Option<Payload>> {
+            self.inner.poll(timeout)
+        }
+
+        fn set_version(&mut self, version: u8) {
+            self.inner.set_version(version)
+        }
+
+        fn suggested_dwell_ms(&mut self) -> u16 {
+            self.suggest_ms
+        }
+    }
+
+    #[test]
+    fn a_slow_camera_gets_the_dwell_it_asks_for_on_both_sides() {
+        let (mut send_opt, recv_end) = pair();
+        let mut recv_opt = SlowCamera {
+            inner: recv_end,
+            suggest_ms: 700,
+        };
+        let cfg = LinkConfig::fast();
+
+        let send_t = thread::spawn(move || {
+            run_send_handshake(&mut send_opt, "dir".into(), 10, &[1u8, 2, 3], [7; 32], cfg).unwrap()
+        });
+        let recv_session =
+            run_recv_handshake(&mut recv_opt, &scratch_dir("dwell"), false, cfg).unwrap();
+        let send_session = send_t.join().unwrap();
+
+        // The probe table would have said 150 ms for v40.
+        assert_eq!(recv_session.dwell_ms, 700);
+        assert_eq!(
+            send_session.dwell_ms, 700,
+            "LINK must carry the receiver's dwell to the sender"
+        );
+    }
+
+    #[test]
+    fn the_retry_floor_wins_when_it_is_higher_than_the_camera_suggests() {
+        let (mut send_opt, recv_end) = pair();
+        let mut recv_opt = SlowCamera {
+            inner: recv_end,
+            suggest_ms: 200,
+        };
+        let cfg = LinkConfig {
+            fast: true,
+            dwell_floor_ms: 900,
+            ..LinkConfig::default()
+        };
+
+        let send_t = thread::spawn(move || {
+            run_send_handshake(&mut send_opt, "dir".into(), 10, &[1u8, 2, 3], [7; 32], cfg).unwrap()
+        });
+        let recv_session =
+            run_recv_handshake(&mut recv_opt, &scratch_dir("dwell-floor"), false, cfg).unwrap();
+        send_t.join().unwrap();
+        assert_eq!(recv_session.dwell_ms, 900);
+    }
+
     #[test]
     fn each_side_stops_for_the_operator_once_per_phase() {
         let (send_end, recv_end) = pair();
@@ -602,8 +756,9 @@ mod tests {
         let (send_end, recv_end) = pair();
         let cfg = LinkConfig {
             fast: true,
-            gated: true,
+            gates: true,
             max_qr_version: 15,
+            ..LinkConfig::default()
         };
         let (mut send_opt, _, send_shown) = gated(send_end);
         let (mut recv_opt, recv_prompts, _) = gated(recv_end);
@@ -636,8 +791,8 @@ mod tests {
         // Two probes offered (cap v15), only the second arrives.
         let cfg = LinkConfig {
             fast: true,
-            gated: false,
             max_qr_version: 15,
+            ..LinkConfig::default()
         };
         assert_eq!(eligible_probe_count(cfg, Some(1)), 2);
 
