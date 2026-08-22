@@ -7,5 +7,6 @@ pub mod optical;
 pub mod link;
 pub mod transport;
 pub mod live;
+pub mod tui;
 
 pub use error::{Error, Result};

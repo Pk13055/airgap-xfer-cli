@@ -25,6 +25,15 @@ pub enum Error {
     BadFrame,
     #[error("interrupted")]
     Interrupted,
+    #[error("aborted by operator")]
+    Aborted,
+    #[error("terminal too small: need at least {need_cols}x{need_rows}, have {have_cols}x{have_rows}")]
+    TerminalTooSmall {
+        need_cols: u16,
+        need_rows: u16,
+        have_cols: u16,
+        have_rows: u16,
+    },
     #[error("{0}")]
     Message(String),
 }

@@ -22,11 +22,60 @@ pub const PROBES: [(u8, u8, u16); 6] = [
     (5, 40, 150),
 ];
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct LinkConfig {
     /// Shortens HELLO/LINK/GO timeouts to 100/50/50 ms, quiet time to 20 ms,
     /// and skips probe dwell sleeps.
     pub fast: bool,
+    /// Pauses at each phase boundary for an operator confirmation and
+    /// stretches the HELLO/LINK/GO timeouts to [`GATED_TIMEOUT`] so the peer
+    /// keeps waiting while a human reads the screen and presses Enter.
+    pub gated: bool,
+    /// Highest QR version this side can display without clipping. Probes above
+    /// it are never offered, and never chosen from the other peer's offers: a
+    /// clipped code is undecodable.
+    pub max_qr_version: u8,
+}
+
+/// Timeout used for peer replies when a human sits between the phases.
+pub const GATED_TIMEOUT: Duration = Duration::from_secs(600);
+
+impl Default for LinkConfig {
+    fn default() -> Self {
+        Self {
+            fast: false,
+            gated: false,
+            max_qr_version: 40,
+        }
+    }
+}
+
+impl LinkConfig {
+    /// Millisecond timeouts and no dwell sleeps, for in-process tests.
+    pub fn fast() -> Self {
+        Self {
+            fast: true,
+            ..Self::default()
+        }
+    }
+
+    /// Turn-based gates on top of another config, keeping its timeouts.
+    pub fn with_gates(self) -> Self {
+        Self {
+            gated: true,
+            ..self
+        }
+    }
+
+    /// Interactive settings: turn-based gates, generous timeouts, and QR
+    /// versions capped to what this terminal can draw.
+    pub fn gated(max_qr_version: u8) -> Self {
+        Self {
+            fast: false,
+            gated: true,
+            max_qr_version,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -41,24 +90,36 @@ pub struct Session {
 }
 
 fn hello_timeout(cfg: LinkConfig) -> Duration {
+    // `fast` is the test knob and wins: gated timeouts are minutes long
+    // because a human is in the loop, which no test wants to wait for.
     if cfg.fast {
         Duration::from_millis(100)
+    } else if cfg.gated {
+        GATED_TIMEOUT
     } else {
         Duration::from_secs(30)
     }
 }
 
 fn link_timeout(cfg: LinkConfig) -> Duration {
+    // `fast` is the test knob and wins: gated timeouts are minutes long
+    // because a human is in the loop, which no test wants to wait for.
     if cfg.fast {
         Duration::from_millis(50)
+    } else if cfg.gated {
+        GATED_TIMEOUT
     } else {
         Duration::from_secs(5)
     }
 }
 
 fn go_timeout(cfg: LinkConfig) -> Duration {
+    // `fast` is the test knob and wins: gated timeouts are minutes long
+    // because a human is in the loop, which no test wants to wait for.
     if cfg.fast {
         Duration::from_millis(50)
+    } else if cfg.gated {
+        GATED_TIMEOUT
     } else {
         Duration::from_secs(15)
     }
@@ -108,13 +169,27 @@ pub fn run_send_handshake(
     if hello.is_none() {
         return Err(Error::HandshakeTimeout);
     }
+    opt.log("receiver said HELLO");
+    if !opt.gate("Receiver found. Enter to run link probes")? {
+        return Err(Error::Aborted);
+    }
 
-    for (id, qr_version, dwell_ms) in PROBES {
+    // Probes above what this terminal can draw would render clipped and
+    // never decode, so they are dropped rather than offered.
+    let probes: Vec<_> = PROBES
+        .iter()
+        .copied()
+        .filter(|(_, qr_version, _)| *qr_version <= cfg.max_qr_version)
+        .collect();
+    let Some(&(last_id, _, _)) = probes.last() else {
+        return Err(Error::NoUsableProbe);
+    };
+    for (id, qr_version, dwell_ms) in probes {
         opt.show(&Payload::Probe {
             id,
             qr_version,
             dwell_ms,
-            last: id == 5,
+            last: id == last_id,
         })?;
         if !cfg.fast {
             thread::sleep(Duration::from_millis(dwell_ms.into()));
@@ -134,9 +209,19 @@ pub fn run_send_handshake(
         return Err(Error::HandshakeFailed);
     };
 
+    if qr_version > cfg.max_qr_version {
+        return Err(Error::NoUsableProbe);
+    }
+
     // Lock the QR version before GO is shown so GO (and everything after
     // it) is encoded at the negotiated version instead of the probe default.
     opt.set_version(qr_version);
+    opt.log(&format!(
+        "linked at QR v{qr_version}, {dwell_ms} ms dwell"
+    ));
+    if !opt.gate(&format!("Linked at QR v{qr_version}. Enter to offer the file"))? {
+        return Err(Error::Aborted);
+    }
 
     let chunk_size = data_chunk_size(qr_version);
     if chunk_size == 0 {
@@ -159,6 +244,7 @@ pub fn run_send_handshake(
     if ack.is_none() {
         return Err(Error::HandshakeFailed);
     }
+    opt.log("receiver accepted the offer");
 
     Ok(Session {
         qr_version,
@@ -171,6 +257,19 @@ pub fn run_send_handshake(
     })
 }
 
+/// Number of probes that could plausibly have been received: those the sender
+/// offered (inferred from the id it flagged `last`, when that frame arrived)
+/// and that this terminal is large enough to display.
+fn eligible_probe_count(cfg: LinkConfig, last_offered_id: Option<u8>) -> usize {
+    PROBES
+        .iter()
+        .filter(|(id, qr_version, _)| {
+            *qr_version <= cfg.max_qr_version
+                && last_offered_id.is_none_or(|last_id| *id <= last_id)
+        })
+        .count()
+}
+
 pub fn run_recv_handshake(
     opt: &mut impl Optical,
     outdir: &Path,
@@ -180,6 +279,9 @@ pub fn run_recv_handshake(
     let hello_deadline = Instant::now() + hello_timeout(cfg);
     let mut probes = Vec::new();
     let mut saw_last;
+    // Id of the probe the sender flagged as its last. The sender only offers
+    // probes its own display can draw, so this is how many were on the table.
+    let mut last_offered_id = None;
 
     loop {
         // Only the deadline expiring becomes HandshakeTimeout. Real errors
@@ -204,6 +306,9 @@ pub fn run_recv_handshake(
             }) => {
                 probes.push((id, qr_version, dwell_ms));
                 saw_last = last;
+                if last {
+                    last_offered_id = Some(id);
+                }
                 break;
             }
             Some(_) | None => {}
@@ -231,6 +336,9 @@ pub fn run_recv_handshake(
                     probes.push((id, qr_version, dwell_ms));
                     quiet_deadline = Instant::now() + quiet;
                     saw_last = last;
+                    if last {
+                        last_offered_id = Some(id);
+                    }
                 }
                 Some(_) => {}
                 None => break,
@@ -238,7 +346,10 @@ pub fn run_recv_handshake(
         }
     }
 
-    probes.retain(|(id, _, _)| PROBES.iter().any(|(probe_id, _, _)| id == probe_id));
+    probes.retain(|(id, qr_version, _)| {
+        *qr_version <= cfg.max_qr_version
+            && PROBES.iter().any(|(probe_id, _, _)| id == probe_id)
+    });
     let successful_count = probes
         .iter()
         .map(|(id, _, _)| *id)
@@ -249,11 +360,27 @@ pub fn run_recv_handshake(
         .copied()
         .max_by_key(|(_, qr_version, _)| *qr_version)
         .ok_or(Error::NoUsableProbe)?;
-    let probe_loss = (100 * (6 - successful_count) / 6) as u8;
+
+    // Loss is measured only against probes that could have counted: ones the
+    // sender actually offered *and* this terminal is large enough to draw.
+    // Charging the operator for probes nobody offered would report a
+    // two-thirds loss on a flawless link and send them off adjusting lamps.
+    let eligible_count = eligible_probe_count(cfg, last_offered_id);
+    let probe_loss = (100 * eligible_count.saturating_sub(successful_count))
+        .checked_div(eligible_count)
+        .unwrap_or(0) as u8;
 
     // Lock the QR version as soon as it's chosen so LINK (and GO) are
     // encoded at the negotiated version rather than the probe default.
     opt.set_version(qr_version);
+    opt.log(&format!(
+        "sender found: best readable QR v{qr_version}, {probe_loss}% probe loss"
+    ));
+    if !opt.gate(&format!(
+        "Sender found at QR v{qr_version} ({probe_loss}% probe loss). Enter to accept the link"
+    ))? {
+        return Err(Error::Aborted);
+    }
 
     opt.show(&Payload::Link {
         qr_version,
@@ -289,6 +416,19 @@ pub fn run_recv_handshake(
         return Err(Error::DestExists(outdir.join(basename)));
     }
 
+    opt.log(&format!(
+        "offer: {basename}, {compressed_size} B compressed, {chunk_count} chunks"
+    ));
+    if !opt.gate(&format!(
+        "Incoming {basename} ({compressed_size} B, {chunk_count} chunks) into {}. Enter to accept",
+        outdir.display()
+    ))? {
+        opt.show(&Payload::Fail {
+            reason: FAIL_ABORTED,
+        })?;
+        return Err(Error::Aborted);
+    }
+
     opt.show(&Payload::Ack {
         window_base: 0,
         bitmap: 0,
@@ -309,6 +449,7 @@ pub fn run_recv_handshake(
 mod tests {
     use super::*;
     use crate::optical::{pair, Optical};
+    use std::sync::{Arc, Mutex};
     use std::thread;
 
     struct LastProbeOptical {
@@ -348,10 +489,184 @@ mod tests {
         }
     }
 
+    /// Wraps a channel end, recording every gate prompt and optionally
+    /// declining the nth one.
+    struct Gated<T> {
+        inner: T,
+        prompts: Arc<Mutex<Vec<String>>>,
+        decline_at: Option<usize>,
+        shown: Arc<Mutex<Vec<Payload>>>,
+    }
+
+    impl<T: Optical> Optical for Gated<T> {
+        fn show(&mut self, payload: &Payload) -> Result<()> {
+            self.shown.lock().unwrap().push(payload.clone());
+            self.inner.show(payload)
+        }
+
+        fn poll(&mut self, timeout: Duration) -> Result<Option<Payload>> {
+            self.inner.poll(timeout)
+        }
+
+        fn set_version(&mut self, version: u8) {
+            self.inner.set_version(version)
+        }
+
+        fn gate(&mut self, prompt: &str) -> Result<bool> {
+            let mut prompts = self.prompts.lock().unwrap();
+            prompts.push(prompt.to_string());
+            Ok(self.decline_at != Some(prompts.len() - 1))
+        }
+    }
+
+    type Recorded<T> = Arc<Mutex<Vec<T>>>;
+
+    fn gated<T>(inner: T) -> (Gated<T>, Recorded<String>, Recorded<Payload>) {
+        let prompts = Arc::new(Mutex::new(Vec::new()));
+        let shown = Arc::new(Mutex::new(Vec::new()));
+        (
+            Gated {
+                inner,
+                prompts: Arc::clone(&prompts),
+                decline_at: None,
+                shown: Arc::clone(&shown),
+            },
+            prompts,
+            shown,
+        )
+    }
+
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        let out = std::env::temp_dir().join(format!("ag-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&out);
+        std::fs::create_dir_all(&out).unwrap();
+        out
+    }
+
+    #[test]
+    fn each_side_stops_for_the_operator_once_per_phase() {
+        let (send_end, recv_end) = pair();
+        let (mut send_opt, send_prompts, _) = gated(send_end);
+        let (mut recv_opt, recv_prompts, _) = gated(recv_end);
+        let cfg = LinkConfig::fast().with_gates();
+
+        let send_t = thread::spawn(move || {
+            run_send_handshake(&mut send_opt, "dir".into(), 10, &[1u8, 2, 3], [7; 32], cfg).unwrap()
+        });
+        let recv_t = thread::spawn(move || {
+            run_recv_handshake(&mut recv_opt, &scratch_dir("gate-ok"), false, cfg).unwrap()
+        });
+        send_t.join().unwrap();
+        recv_t.join().unwrap();
+
+        // Sender: peer found, then link negotiated. Receiver: sender found,
+        // then the incoming file offer.
+        let send_prompts = send_prompts.lock().unwrap().clone();
+        assert_eq!(send_prompts.len(), 2, "{send_prompts:?}");
+        assert!(send_prompts[0].contains("Receiver found"));
+        assert!(send_prompts[1].contains("Linked at QR v"));
+
+        let recv_prompts = recv_prompts.lock().unwrap().clone();
+        assert_eq!(recv_prompts.len(), 2, "{recv_prompts:?}");
+        assert!(recv_prompts[0].contains("Sender found"));
+        assert!(recv_prompts[1].contains("Incoming dir"));
+    }
+
+    #[test]
+    fn declining_the_offer_tells_the_sender_and_aborts() {
+        let (send_end, recv_end) = pair();
+        let (mut send_opt, _, _) = gated(send_end);
+        let (mut recv_opt, _, recv_shown) = gated(recv_end);
+        recv_opt.decline_at = Some(1); // the incoming-file prompt
+        let cfg = LinkConfig::fast().with_gates();
+
+        let send_t = thread::spawn(move || {
+            run_send_handshake(&mut send_opt, "dir".into(), 10, &[1u8, 2, 3], [7; 32], cfg)
+        });
+        let err = run_recv_handshake(&mut recv_opt, &scratch_dir("gate-no"), false, cfg).unwrap_err();
+        assert!(matches!(err, Error::Aborted), "{err:?}");
+        assert!(
+            recv_shown.lock().unwrap().iter().any(|payload| matches!(
+                payload,
+                Payload::Fail {
+                    reason: FAIL_ABORTED
+                }
+            )),
+            "the sender must be told, not left waiting"
+        );
+        assert!(send_t.join().unwrap().is_err());
+    }
+
+    #[test]
+    fn a_terminal_that_cannot_draw_large_codes_never_offers_or_picks_them() {
+        let (send_end, recv_end) = pair();
+        let cfg = LinkConfig {
+            fast: true,
+            gated: true,
+            max_qr_version: 15,
+        };
+        let (mut send_opt, _, send_shown) = gated(send_end);
+        let (mut recv_opt, recv_prompts, _) = gated(recv_end);
+
+        let send_t = thread::spawn(move || {
+            run_send_handshake(&mut send_opt, "dir".into(), 10, &[1u8, 2, 3], [7; 32], cfg).unwrap()
+        });
+        let recv_session =
+            run_recv_handshake(&mut recv_opt, &scratch_dir("gate-cap"), false, cfg).unwrap();
+        let send_session = send_t.join().unwrap();
+
+        assert_eq!(recv_session.qr_version, 15);
+        assert_eq!(send_session.qr_version, 15);
+        assert!(
+            send_shown
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|payload| !matches!(payload, Payload::Probe { qr_version, .. } if *qr_version > 15)),
+            "probes above the display limit must never be offered"
+        );
+        // The four probes above v15 were never on the table, so they are not
+        // losses: a clean capped link must report 0%, not 66%.
+        let prompt = recv_prompts.lock().unwrap()[0].clone();
+        assert!(prompt.contains("(0% probe loss)"), "{prompt}");
+    }
+
+    #[test]
+    fn losing_an_offered_probe_still_counts_against_the_link() {
+        // Two probes offered (cap v15), only the second arrives.
+        let cfg = LinkConfig {
+            fast: true,
+            gated: false,
+            max_qr_version: 15,
+        };
+        assert_eq!(eligible_probe_count(cfg, Some(1)), 2);
+
+        // Capping at v15 alone does not shrink the denominator below what the
+        // sender offered, so a probe that really was lost still shows up.
+        assert_eq!(eligible_probe_count(cfg, None), 2);
+
+        // Uncapped, with the sender's `last` flag lost: fall back to the full
+        // probe ladder rather than silently shrinking the denominator.
+        assert_eq!(
+            eligible_probe_count(LinkConfig::default(), None),
+            PROBES.len()
+        );
+    }
+
+    #[test]
+    fn gated_configs_wait_minutes_so_a_human_can_read_the_screen() {
+        let cfg = LinkConfig::gated(15);
+        assert_eq!(hello_timeout(cfg), GATED_TIMEOUT);
+        assert_eq!(link_timeout(cfg), GATED_TIMEOUT);
+        assert_eq!(go_timeout(cfg), GATED_TIMEOUT);
+        // The ungated live path keeps its original, tighter budgets.
+        assert_eq!(hello_timeout(LinkConfig::default()), Duration::from_secs(30));
+    }
+
     #[test]
     fn handshake_picks_highest_passing_probe() {
         let (mut send_opt, mut recv_opt) = pair();
-        let cfg = LinkConfig { fast: true };
+        let cfg = LinkConfig::fast();
         let blob = vec![1u8, 2, 3, 4, 5];
         let sha256 = [1u8; 32];
         let send_t = thread::spawn(move || {
@@ -377,7 +692,7 @@ mod tests {
         // keeps timing out, so this must become HandshakeTimeout once the
         // deadline passes rather than erroring out early.
         let (_send_end, mut recv_end) = pair();
-        let cfg = LinkConfig { fast: true };
+        let cfg = LinkConfig::fast();
         let out = std::env::temp_dir();
         let err = run_recv_handshake(&mut recv_end, &out, false, cfg).unwrap_err();
         assert!(matches!(err, crate::Error::HandshakeTimeout));
@@ -402,7 +717,7 @@ mod tests {
             &mut opt,
             &std::env::temp_dir(),
             false,
-            LinkConfig { fast: true },
+            LinkConfig::fast(),
         )
         .unwrap_err();
         assert!(matches!(err, Error::Message(m) if m == "boom"));
@@ -412,7 +727,7 @@ mod tests {
     fn hello_loop_propagates_disconnect_instead_of_masking_as_timeout() {
         let (send_end, mut recv_end) = pair();
         drop(send_end);
-        let cfg = LinkConfig { fast: true };
+        let cfg = LinkConfig::fast();
         let out = std::env::temp_dir();
         let err = run_recv_handshake(&mut recv_end, &out, false, cfg).unwrap_err();
         assert!(matches!(err, crate::Error::Message(_)));
@@ -449,7 +764,7 @@ mod tests {
             version_set_before_go: None,
             version_set: false,
         };
-        let cfg = LinkConfig { fast: true };
+        let cfg = LinkConfig::fast();
         let blob = vec![1u8, 2, 3, 4, 5];
         let sha256 = [1u8; 32];
 
@@ -503,7 +818,7 @@ mod tests {
             version_set_before_link: None,
             version_set: false,
         };
-        let cfg = LinkConfig { fast: true };
+        let cfg = LinkConfig::fast();
         let blob = vec![1u8, 2, 3, 4, 5];
         let sha256 = [1u8; 32];
 
@@ -548,7 +863,7 @@ mod tests {
             &mut opt,
             &std::env::temp_dir(),
             false,
-            LinkConfig { fast: true },
+            LinkConfig::fast(),
         )
         .unwrap_err();
 
@@ -565,7 +880,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&out);
         std::fs::create_dir_all(&out).unwrap();
 
-        run_recv_handshake(&mut opt, &out, false, LinkConfig { fast: true }).unwrap();
+        run_recv_handshake(&mut opt, &out, false, LinkConfig::fast()).unwrap();
 
         assert_eq!(opt.poll_count, 2);
     }

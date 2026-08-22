@@ -34,6 +34,60 @@ pub fn encode_version(data: &[u8], version: u8) -> Result<GrayImage> {
     Ok(image)
 }
 
+/// Total module count per side for `version`, including the quiet zone.
+///
+/// QR version `v` is `17 + 4v` modules wide; `encode_version` pads it with a
+/// [`QUIET_ZONE_MODULES`]-wide border on every side.
+pub fn modules_for_version(version: u8) -> usize {
+    17 + 4 * version as usize + QUIET_ZONE_MODULES * 2
+}
+
+/// Terminal cells a `version` code occupies when drawn two modules per row:
+/// `(columns, rows)`.
+pub fn cell_size_for_version(version: u8) -> (u16, u16) {
+    let modules = modules_for_version(version);
+    (modules as u16, modules.div_ceil(2) as u16)
+}
+
+/// Every QR version the protocol can carry a frame at, smallest first.
+/// Versions outside this set have no capacity entry in [`frame`] and cannot be
+/// encoded at all.
+pub const SUPPORTED_VERSIONS: [u8; 6] = [10, 15, 20, 25, 30, 40];
+
+/// Largest supported QR version that renders without clipping in a
+/// `cols` x `rows` terminal area, or `None` if even the smallest does not fit.
+///
+/// A clipped QR code is undecodable, so both peers must refuse to negotiate a
+/// version their own display cannot draw in full.
+pub fn max_version_for_area(cols: u16, rows: u16) -> Option<u8> {
+    SUPPORTED_VERSIONS
+        .iter()
+        .copied()
+        .rev()
+        .find(|&version| {
+            let (need_cols, need_rows) = cell_size_for_version(version);
+            need_cols <= cols && need_rows <= rows
+        })
+}
+
+/// Smallest supported QR version, and therefore the floor on terminal size.
+pub fn smallest_version() -> u8 {
+    SUPPORTED_VERSIONS[0]
+}
+
+/// Returns whether module `(mx, my)` of a rendered code is dark, sampling the
+/// center pixel of the module so the `MODULE_SCALE` raster does not matter.
+pub fn module_is_dark(img: &GrayImage, mx: usize, my: usize, invert: bool) -> bool {
+    let px = (mx * MODULE_SCALE + MODULE_SCALE / 2) as u32;
+    let py = (my * MODULE_SCALE + MODULE_SCALE / 2) as u32;
+    is_dark(img.get_pixel(px, py)[0], invert)
+}
+
+/// Module count per side of an already-rendered code image.
+pub fn modules_of(img: &GrayImage) -> usize {
+    img.width() as usize / MODULE_SCALE
+}
+
 /// Decodes a QR code image, preserving its binary payload.
 pub fn decode_image(img: &GrayImage) -> Result<Vec<u8>> {
     rxing::helpers::detect_in_luma(
@@ -100,6 +154,29 @@ fn is_dark(value: u8, invert: bool) -> bool {
 mod tests {
     use super::*;
     use crate::frame;
+
+    #[test]
+    fn cell_size_matches_rendered_output() {
+        for version in SUPPORTED_VERSIONS {
+            let img = encode_version(b"AX", version).unwrap();
+            let (cols, rows) = cell_size_for_version(version);
+            assert_eq!(modules_of(&img) as u16, cols);
+            assert_eq!(cols.div_ceil(2), rows);
+        }
+    }
+
+    #[test]
+    fn max_version_for_area_rejects_areas_that_would_clip() {
+        // Version 10 needs 65x33 cells; one column short must drop a version.
+        let (cols, rows) = cell_size_for_version(10);
+        assert_eq!((cols, rows), (65, 33));
+        assert_eq!(max_version_for_area(cols, rows), Some(10));
+        // Version 10 is the floor: one column short leaves nothing usable.
+        assert_eq!(max_version_for_area(cols - 1, rows), None);
+        assert_eq!(max_version_for_area(cols, rows - 1), None);
+        let (big_cols, big_rows) = cell_size_for_version(20);
+        assert_eq!(max_version_for_area(big_cols, big_rows), Some(20));
+    }
 
     #[test]
     fn qr_roundtrip_binary_envelope() {

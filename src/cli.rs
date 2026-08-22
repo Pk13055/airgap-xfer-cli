@@ -7,12 +7,23 @@ use crate::{
     link::{self, LinkConfig},
     live,
     optical::Optical,
-    pack, transport,
-    transport::TransportConfig,
+    pack,
+    transport::{self, TransportConfig},
+    tui,
 };
 
+/// A version 10 QR code is 65 columns by 33 rows once drawn two modules per
+/// terminal cell, and it cannot be shrunk further without becoming
+/// undecodable. The TUI sheds its borders, footer, and transcript to fit, so
+/// the hard floor is the code itself plus a title and a prompt line.
+const SIZE_NOTE: &str = "Both terminals need at least 65x35 cells: the smallest usable QR code is \
+65x33 on its own, and a clipped code cannot be read by the other camera. The \
+layout drops its borders and transcript on short terminals to make room. \
+Transfers are turn based -- each side pauses at every phase and waits for \
+Enter (Esc declines, q quits).";
+
 #[derive(Parser, Debug)]
-#[command(name = "airgap-xfer", version)]
+#[command(name = "airgap-xfer", version, after_help = SIZE_NOTE)]
 pub struct Cli {
     #[command(subcommand)]
     pub cmd: Cmd,
@@ -77,32 +88,36 @@ fn is_interrupted(result: &crate::Result<()>) -> bool {
 }
 
 fn send(path: PathBuf, camera: u32, keep_temp: bool, no_invert: bool) -> crate::Result<()> {
-    let packed = pack::pack(&path)?;
+    let mut packed = pack::pack(&path)?;
     if !keep_temp {
         live::set_temp_path(Some(packed.temp_path.clone()));
     }
 
-    let result = (|| -> crate::Result<()> {
+    let temp_path = packed.temp_path.clone();
+    let warnings = std::mem::take(&mut packed.warnings);
+    let title = format!("airgap-xfer · SEND {}", packed.basename);
+    let result = tui::run(&title, camera, no_invert, move |mut opt, max_version| {
         let blob = fs::read(&packed.temp_path)?;
-        let mut opt = live::LiveOptical::open(camera, no_invert)?;
-        let cfg = LinkConfig { fast: false };
         let session = link::run_send_handshake(
             &mut opt,
             packed.basename.clone(),
             packed.uncompressed_hint,
             &blob,
             packed.sha256,
-            cfg,
+            LinkConfig::gated(max_version),
         )?;
-        transport::send_blob(&mut opt, &session, &blob, TransportConfig { fast: false })?;
-        Ok(())
-    })();
+        transport::send_blob(&mut opt, &session, &blob, TransportConfig::gated())?;
+        Ok(format!(
+            "sent {} ({} B in {} chunks at QR v{})",
+            session.basename, session.compressed_size, session.chunk_count, session.qr_version
+        ))
+    });
 
     live::set_temp_path(None);
     if !keep_temp {
-        pack::remove_temp(&packed.temp_path);
+        pack::remove_temp(&temp_path);
     }
-    for warning in &packed.warnings {
+    for warning in &warnings {
         eprintln!("warning: {warning}");
     }
     result
@@ -115,53 +130,63 @@ fn recv(
     keep_temp: bool,
     no_invert: bool,
 ) -> crate::Result<()> {
-    let mut opt = live::LiveOptical::open(camera, no_invert)?;
-    let cfg = LinkConfig { fast: false };
-    let session = link::run_recv_handshake(&mut opt, &outdir, force, cfg)?;
-    let blob = transport::recv_blob(&mut opt, &session, TransportConfig { fast: false })?;
+    let title = format!("airgap-xfer · RECV into {}", outdir.display());
+    tui::run(&title, camera, no_invert, move |mut opt, max_version| {
+        let session =
+            link::run_recv_handshake(&mut opt, &outdir, force, LinkConfig::gated(max_version))?;
+        let blob = transport::recv_blob(&mut opt, &session, TransportConfig::gated())?;
 
-    // recv_blob only verifies the hash; it deliberately does not send OK.
-    // The sender must not see OK until the blob is durably written (and
-    // unpacked) here, so write+unpack happens before we show OK/FAIL.
-    let temp_path = std::env::temp_dir().join(format!(
-        "airgap-xfer-{}-{}.tar.zst",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|err| crate::Error::Message(format!("system clock before UNIX epoch: {err}")))?
-            .as_nanos()
-    ));
-    if !keep_temp {
-        live::set_temp_path(Some(temp_path.clone()));
-    }
-
-    let write_and_unpack = (|| -> crate::Result<()> {
-        fs::write(&temp_path, &blob)?;
-        pack::unpack(&temp_path, &outdir, force)?;
-        Ok(())
-    })();
-
-    match &write_and_unpack {
-        Ok(()) => {
-            opt.show(&frame::Payload::Ok)?;
+        // recv_blob only verifies the hash; it deliberately does not send OK.
+        // The sender must not see OK until the blob is durably written (and
+        // unpacked) here, so write+unpack happens before we show OK/FAIL.
+        let temp_path = std::env::temp_dir().join(format!(
+            "airgap-xfer-{}-{}.tar.zst",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|err| crate::Error::Message(format!(
+                    "system clock before UNIX epoch: {err}"
+                )))?
+                .as_nanos()
+        ));
+        if !keep_temp {
+            live::set_temp_path(Some(temp_path.clone()));
         }
-        Err(crate::Error::Io(io_err)) if io_err.kind() == std::io::ErrorKind::StorageFull => {
-            opt.show(&frame::Payload::Fail {
-                reason: frame::FAIL_DISK,
-            })?;
-        }
-        Err(_) => {
-            opt.show(&frame::Payload::Fail {
-                reason: frame::FAIL_PROTOCOL,
-            })?;
-        }
-    }
 
-    live::set_temp_path(None);
-    if !keep_temp {
-        pack::remove_temp(&temp_path);
-    }
-    write_and_unpack
+        opt.log("writing and unpacking the archive");
+        let write_and_unpack = (|| -> crate::Result<()> {
+            fs::write(&temp_path, &blob)?;
+            pack::unpack(&temp_path, &outdir, force)?;
+            Ok(())
+        })();
+
+        match &write_and_unpack {
+            Ok(()) => {
+                opt.show(&frame::Payload::Ok)?;
+            }
+            Err(crate::Error::Io(io_err)) if io_err.kind() == std::io::ErrorKind::StorageFull => {
+                opt.show(&frame::Payload::Fail {
+                    reason: frame::FAIL_DISK,
+                })?;
+            }
+            Err(_) => {
+                opt.show(&frame::Payload::Fail {
+                    reason: frame::FAIL_PROTOCOL,
+                })?;
+            }
+        }
+
+        live::set_temp_path(None);
+        if !keep_temp {
+            pack::remove_temp(&temp_path);
+        }
+        write_and_unpack?;
+        Ok(format!(
+            "received {} into {}",
+            session.basename,
+            outdir.display()
+        ))
+    })
 }
 
 #[cfg(test)]

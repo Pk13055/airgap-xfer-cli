@@ -19,6 +19,21 @@ pub trait Optical {
     /// Sets the QR version used to encode non-probe payloads. No-op by
     /// default.
     fn set_version(&mut self, _version: u8) {}
+
+    /// Appends a line to the operator-visible transcript of the transfer.
+    /// No-op by default.
+    fn log(&mut self, _line: &str) {}
+
+    /// Blocks until the operator confirms the upcoming phase described by
+    /// `prompt`, returning `Ok(true)` to proceed and `Ok(false)` to abort.
+    ///
+    /// Turn taking is what makes the two terminals legible to a human: each
+    /// side pauses at a phase boundary so the operator can see what the peer
+    /// just said before committing to the next step. Non-interactive channels
+    /// (the in-process test pair) proceed automatically.
+    fn gate(&mut self, _prompt: &str) -> Result<bool> {
+        Ok(true)
+    }
 }
 
 pub struct PairEnd {

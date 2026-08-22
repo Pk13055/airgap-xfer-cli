@@ -19,6 +19,28 @@ const STALL_LIMIT: u32 = 20;
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TransportConfig {
     pub fast: bool,
+    /// Pauses for an operator confirmation before the first DATA frame. The
+    /// chunk loop itself is never gated: a human cannot arbitrate thousands of
+    /// frames, and the ACK protocol already paces the window.
+    pub gated: bool,
+}
+
+impl TransportConfig {
+    /// Millisecond timeouts, for in-process tests.
+    pub fn fast() -> Self {
+        Self {
+            fast: true,
+            gated: false,
+        }
+    }
+
+    /// Interactive settings: one confirmation before the transfer starts.
+    pub fn gated() -> Self {
+        Self {
+            fast: false,
+            gated: true,
+        }
+    }
 }
 
 fn ack_timeout(cfg: TransportConfig) -> Duration {
@@ -93,6 +115,13 @@ pub fn send_blob(
     };
     if chunk_count != session.chunk_count {
         return Err(Error::HandshakeFailed);
+    }
+
+    if cfg.gated && !opt.gate(&format!(
+        "Ready to send {} in {chunk_count} chunks. Enter to start the transfer",
+        session.basename
+    ))? {
+        return Err(Error::Aborted);
     }
 
     let start_time = Instant::now();
@@ -327,6 +356,31 @@ mod tests {
         }
     }
 
+    struct Gated<T> {
+        inner: T,
+        prompts: Vec<String>,
+        allow: bool,
+        data_shown: usize,
+    }
+
+    impl<T: Optical> Optical for Gated<T> {
+        fn show(&mut self, payload: &Payload) -> Result<()> {
+            if matches!(payload, Payload::Data { .. }) {
+                self.data_shown += 1;
+            }
+            self.inner.show(payload)
+        }
+
+        fn poll(&mut self, timeout: Duration) -> Result<Option<Payload>> {
+            self.inner.poll(timeout)
+        }
+
+        fn gate(&mut self, prompt: &str) -> Result<bool> {
+            self.prompts.push(prompt.to_string());
+            Ok(self.allow)
+        }
+    }
+
     fn session_for(blob: &[u8], version: u8) -> Session {
         let cs = data_chunk_size(version);
         let chunk_count = ((blob.len() + cs - 1) / cs) as u32;
@@ -345,11 +399,75 @@ mod tests {
     }
 
     #[test]
+    fn the_operator_confirms_once_before_the_first_chunk_not_once_per_chunk() {
+        let blob: Vec<u8> = (0..2000u32).map(|i| i as u8).collect();
+        let sess = session_for(&blob, 10);
+        let (s, mut r) = pair();
+        let mut s = Gated {
+            inner: s,
+            prompts: Vec::new(),
+            allow: true,
+            data_shown: 0,
+        };
+        let recv_sess = sess.clone();
+        let recv = thread::spawn(move || {
+            let got = recv_blob(&mut r, &recv_sess, TransportConfig::fast()).unwrap();
+            // recv_blob leaves OK to its caller (which must durably write
+            // first); stand in for that here so send_blob unblocks.
+            r.show(&Payload::Ok).unwrap();
+            got
+        });
+        send_blob(
+            &mut s,
+            &sess,
+            &blob,
+            TransportConfig {
+                fast: true,
+                gated: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(recv.join().unwrap(), blob);
+
+        assert_eq!(s.prompts.len(), 1, "{:?}", s.prompts);
+        assert!(s.prompts[0].contains(&format!("{} chunks", sess.chunk_count)));
+        assert!(s.data_shown >= sess.chunk_count as usize);
+    }
+
+    #[test]
+    fn declining_the_start_gate_sends_no_data_at_all() {
+        let blob: Vec<u8> = (0..2000u32).map(|i| i as u8).collect();
+        let sess = session_for(&blob, 10);
+        let (s, _r) = pair();
+        let mut s = Gated {
+            inner: s,
+            prompts: Vec::new(),
+            allow: false,
+            data_shown: 0,
+        };
+        let err = send_blob(
+            &mut s,
+            &sess,
+            &blob,
+            TransportConfig {
+                fast: true,
+                gated: true,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Aborted), "{err:?}");
+        assert_eq!(
+            s.data_shown, 0,
+            "a declined transfer must not blast frames at a receiver that moved on"
+        );
+    }
+
+    #[test]
     fn transfer_zero_loss() {
         let blob: Vec<u8> = (0..2000u32).map(|i| i as u8).collect();
         let sess = session_for(&blob, 10);
         let (mut s, mut r) = pair();
-        let cfg = TransportConfig { fast: true };
+        let cfg = TransportConfig::fast();
         let st = thread::spawn({
             let blob = blob.clone();
             let sess = sess.clone();
@@ -375,7 +493,7 @@ mod tests {
             inner: r,
             drop_data_seq: [0].into_iter().collect(),
         };
-        let cfg = TransportConfig { fast: true };
+        let cfg = TransportConfig::fast();
         let st = thread::spawn({
             let blob = blob.clone();
             let sess = sess.clone();
@@ -399,7 +517,7 @@ mod tests {
             inner: r,
             drop_data_seq: (2..10).collect(),
         };
-        let cfg = TransportConfig { fast: true };
+        let cfg = TransportConfig::fast();
         let st = thread::spawn({
             let blob = blob.clone();
             let sess = sess.clone();
@@ -420,7 +538,7 @@ mod tests {
         let sess = session_for(&blob, 10);
         assert!(sess.chunk_count > WINDOW);
         let (mut s, mut r) = pair();
-        let cfg = TransportConfig { fast: true };
+        let cfg = TransportConfig::fast();
         let st = thread::spawn({
             let blob = blob.clone();
             let sess = sess.clone();
@@ -444,7 +562,7 @@ mod tests {
             inner: r,
             dropped: false,
         };
-        let cfg = TransportConfig { fast: true };
+        let cfg = TransportConfig::fast();
         let st = thread::spawn({
             let blob = blob.clone();
             let sess = sess.clone();
@@ -476,7 +594,7 @@ mod tests {
         .unwrap();
 
         assert!(matches!(
-            recv_blob(&mut r, &sess, TransportConfig { fast: true }),
+            recv_blob(&mut r, &sess, TransportConfig::fast()),
             Err(Error::HandshakeFailed)
         ));
     }
@@ -487,7 +605,7 @@ mod tests {
         let mut sess = session_for(&blob, 10);
         sess.sha256 = [0u8; 32];
         let (mut s, mut r) = pair();
-        let cfg = TransportConfig { fast: true };
+        let cfg = TransportConfig::fast();
         let st = thread::spawn({
             let blob = blob.clone();
             let sess = sess.clone();
@@ -507,7 +625,7 @@ mod tests {
         // which used to loop forever. It must now abort with a bounded
         // number of idle polls instead of hanging.
         let (_send_end, mut recv_end) = pair();
-        let cfg = TransportConfig { fast: true };
+        let cfg = TransportConfig::fast();
         let err = recv_blob(&mut recv_end, &sess, cfg).unwrap_err();
         assert!(matches!(err, Error::Stalled(_)));
     }

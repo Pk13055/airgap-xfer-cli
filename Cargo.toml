@@ -11,6 +11,7 @@ ctrlc = "3.4"
 image = "0.25"
 nokhwa = { version = "0.10", features = ["input-native"] }
 qrcode = "0.14"
+ratatui = "0.29"
 rxing = "0.7"
 sha2 = "0.10"
 tar = "0.4"
