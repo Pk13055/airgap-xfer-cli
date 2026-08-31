@@ -154,24 +154,22 @@ fn recv(
         // recv_blob only verifies the hash; it deliberately does not send OK.
         // The sender must not see OK until the blob is durably written (and
         // unpacked) here, so write+unpack happens before we show OK/FAIL.
-        let temp_path = std::env::temp_dir().join(format!(
-            "airgap-xfer-{}-{}.tar.zst",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_err(|err| crate::Error::Message(format!(
-                    "system clock before UNIX epoch: {err}"
-                )))?
-                .as_nanos()
-        ));
+        let archive_name = pack::archive_filename(&done.session.basename);
+        let archive_path = outdir.join(&archive_name);
         if !keep_temp {
-            live::set_temp_path(Some(temp_path.clone()));
+            live::set_temp_path(Some(archive_path.clone()));
         }
 
-        opt.log("writing and unpacking the archive");
+        opt.log(&format!("writing {archive_name}"));
         let write_and_unpack = (|| -> crate::Result<()> {
-            fs::write(&temp_path, &blob)?;
-            pack::unpack(&temp_path, &outdir, force)?;
+            if let Some(parent) = archive_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(&archive_path, &blob)?;
+            // The `.tar.zst` is the received file. Unpack is a convenience;
+            // if it fails the archive stays so the operator can run
+            // `tar --zstd -xf {archive_name}` themselves.
+            pack::unpack(&archive_path, &outdir, force)?;
             Ok(())
         })();
 
@@ -192,14 +190,11 @@ fn recv(
         }
 
         live::set_temp_path(None);
-        if !keep_temp {
-            pack::remove_temp(&temp_path);
-        }
         write_and_unpack?;
         Ok(format!(
-            "received {} into {}{}",
-            done.session.basename,
+            "received {archive_name} into {} (unpacked {}){}",
             outdir.display(),
+            done.session.basename,
             attempt_note(done.attempt)
         ))
     })

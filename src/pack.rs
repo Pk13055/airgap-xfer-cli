@@ -6,6 +6,23 @@ use sha2::{Digest, Sha256};
 
 use crate::{Error, Result};
 
+/// zstd's maximum compression level. The result is a normal `.tar.zst` stream
+/// (`tar --zstd -xf`, `zstd -d`).
+pub const ZSTD_LEVEL: i32 = 22;
+/// Magic number of a zstd frame (RFC 8878).
+pub const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+
+pub fn archive_filename(basename: &str) -> String {
+    format!("{basename}.tar.zst")
+}
+
+fn zstd_encoder(file: File) -> Result<zstd::Encoder<'static, File>> {
+    let mut encoder = zstd::Encoder::new(file, ZSTD_LEVEL)?;
+    encoder.include_checksum(true)?;
+    encoder.long_distance_matching(true)?;
+    Ok(encoder)
+}
+
 #[derive(Debug)]
 pub struct Packed {
     pub temp_path: PathBuf,
@@ -32,7 +49,7 @@ pub fn pack(path: &Path) -> Result<Packed> {
     ));
 
     let file = File::create(&temp_path)?;
-    let encoder = zstd::Encoder::new(file, 3)?;
+    let encoder = zstd_encoder(file)?;
     let mut tar = tar::Builder::new(encoder);
     let mut warnings = Vec::new();
     let mut entry_count = 0;
@@ -207,7 +224,7 @@ pub fn remove_temp(path: &Path) {
 }
 
 pub fn dest_exists(outdir: &Path, basename: &str) -> bool {
-    outdir.join(basename).exists()
+    outdir.join(basename).exists() || outdir.join(archive_filename(basename)).exists()
 }
 
 fn remove_path_if_exists(path: &Path) -> std::io::Result<()> {
@@ -260,6 +277,8 @@ mod tests {
         let packed = pack(&root.join("dir")).unwrap();
         assert_eq!(packed.basename, "dir");
         assert_eq!(packed.compressed_size, fs::metadata(&packed.temp_path).unwrap().len());
+        let magic = fs::read(&packed.temp_path).unwrap();
+        assert_eq!(&magic[..4], &ZSTD_MAGIC, "archive must be a standard zstd frame");
         assert!(!packed.sha256.iter().all(|b| *b == 0));
 
         let out = root.join("out");
@@ -311,6 +330,18 @@ mod tests {
     }
 
     #[test]
+    fn refuse_existing_archive_file_without_force() {
+        let root = std::env::temp_dir().join(format!("ag-pack-zst-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let out = root.join("out");
+        fs::create_dir_all(&out).unwrap();
+        fs::write(out.join("dir.tar.zst"), b"occupied").unwrap();
+        assert!(dest_exists(&out, "dir"));
+        assert_eq!(archive_filename("dir"), "dir.tar.zst");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn rejects_archive_with_multiple_top_level_entries_without_torn_destination() {
         let root = std::env::temp_dir().join(format!("ag-pack-multiple-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
@@ -318,7 +349,7 @@ mod tests {
 
         let archive_path = root.join("multiple-roots.tar.zst");
         let file = File::create(&archive_path).unwrap();
-        let encoder = zstd::Encoder::new(file, 3).unwrap();
+        let encoder = zstd_encoder(file).unwrap();
         let mut archive = tar::Builder::new(encoder);
         for (path, contents) in [("alpha", b"new" as &[u8]), ("beta", b"other")] {
             let mut header = tar::Header::new_gnu();

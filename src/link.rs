@@ -6,7 +6,7 @@ use std::{
 };
 
 use crate::{
-    frame::{data_chunk_size, Payload, FAIL_ABORTED, ROLE_RECV},
+    frame::{data_chunk_size, qr_byte_capacity, Payload, FAIL_ABORTED, ROLE_RECV},
     optical::Optical,
     pack::dest_exists,
     Error, Result,
@@ -283,15 +283,24 @@ pub fn run_send_handshake(
     if chunk_size == 0 {
         return Err(Error::HandshakeFailed);
     }
+    crate::qr::ensure_full_data_frame_fits(qr_version)?;
     let chunk_count = blob.len().div_ceil(chunk_size).max(1) as u32;
     let compressed_size = blob.len() as u64;
-    opt.show(&Payload::Go {
+    let go = Payload::Go {
         basename: basename.clone(),
         uncompressed_hint,
         compressed_size,
         chunk_count,
         sha256,
-    })?;
+    };
+    let go_len = crate::frame::encode(&go)?.len();
+    let cap = qr_byte_capacity(qr_version);
+    if go_len > cap {
+        return Err(Error::Message(format!(
+            "filename {basename:?} makes the offer {go_len} bytes; QR v{qr_version} holds {cap}"
+        )));
+    }
+    opt.show(&go)?;
 
     let ack = poll_until(opt, go_timeout(cfg), |payload| match payload {
         Payload::Ack { window_base: 0, .. } => Some(()),

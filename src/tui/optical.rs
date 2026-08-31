@@ -109,6 +109,35 @@ impl TuiOptical {
             }
         }
     }
+
+    fn paint(&mut self, payload: &Payload) -> Result<()> {
+        check_interrupted()?;
+
+        let bytes = crate::frame::encode(payload)?;
+        let version = encode_version_for(payload, self.version);
+        let image = Arc::new(qr::encode_version(&bytes, version)?);
+
+        let (drawn, drawn_rx) = std::sync::mpsc::channel();
+        self.send(UiEvent::Show {
+            image,
+            invert: self.invert,
+            label: payload_label(payload),
+            drawn,
+        })?;
+        // Block until the UI confirms the paint, polling the interrupt flag
+        // so Ctrl-C during a long dwell still unwinds. If the UI is gone the
+        // transfer is over anyway.
+        loop {
+            check_interrupted()?;
+            match drawn_rx.recv_timeout(POLL_TICK) {
+                Ok(()) => return Ok(()),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(display_closed())
+                }
+            }
+        }
+    }
 }
 
 /// The error to report when the UI side of a channel goes away.
@@ -141,30 +170,15 @@ pub fn payload_label(payload: &Payload) -> String {
 
 impl Optical for TuiOptical {
     fn show(&mut self, payload: &Payload) -> Result<()> {
-        check_interrupted()?;
-
-        let bytes = crate::frame::encode(payload)?;
-        let version = encode_version_for(payload, self.version);
-        let image = Arc::new(qr::encode_version(&bytes, version)?);
-
-        let (drawn, drawn_rx) = std::sync::mpsc::channel();
-        self.send(UiEvent::Show {
-            image,
-            invert: self.invert,
-            label: payload_label(payload),
-            drawn,
-        })?;
-        // Block until the UI confirms the paint, polling the interrupt flag
-        // so Ctrl-C during a long dwell still unwinds. If the UI is gone the
-        // transfer is over anyway.
-        loop {
-            check_interrupted()?;
-            match drawn_rx.recv_timeout(POLL_TICK) {
-                Ok(()) => return Ok(()),
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    return Err(display_closed())
+        match self.paint(payload) {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                if !matches!(payload, Payload::Fail { .. }) {
+                    let _ = self.paint(&Payload::Fail {
+                        reason: crate::frame::FAIL_PROTOCOL,
+                    });
                 }
+                Err(err)
             }
         }
     }

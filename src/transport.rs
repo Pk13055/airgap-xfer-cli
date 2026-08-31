@@ -346,6 +346,8 @@ pub fn recv_blob(
                     base = end;
                 }
             }
+            Some(Payload::Fail { reason: FAIL_HASH }) => return Err(Error::HashMismatch),
+            Some(Payload::Fail { .. }) => return Err(Error::HandshakeFailed),
             Some(Payload::Fin { .. }) if got.len() == chunk_count as usize => {
                 if blob.len() != compressed_size {
                     return Err(Error::HandshakeFailed);
@@ -723,6 +725,19 @@ mod tests {
         let recv_res = rt.join().unwrap();
         assert!(matches!(recv_res, Err(crate::Error::HashMismatch)));
         assert!(matches!(st.join().unwrap(), Err(crate::Error::HashMismatch)));
+    }
+
+    #[test]
+    fn recv_blob_stops_when_the_sender_reports_fail() {
+        let blob = vec![1u8; 10];
+        let sess = session_for(&blob, 10);
+        let (mut s, mut r) = pair();
+        s.show(&Payload::Fail {
+            reason: crate::frame::FAIL_PROTOCOL,
+        })
+        .unwrap();
+        let err = recv_blob(&mut r, &sess, TransportConfig::fast()).unwrap_err();
+        assert!(matches!(err, Error::HandshakeFailed), "{err:?}");
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use image::{GrayImage, Luma};
+use qrcode::bits::Bits;
 use qrcode::{Color, EcLevel, QrCode, Version};
 
 use crate::{frame, Error, Result};
@@ -6,14 +7,33 @@ use crate::{frame, Error, Result};
 const QUIET_ZONE_MODULES: usize = 4;
 const MODULE_SCALE: usize = 4;
 
-/// Encodes `data` as a fixed-version, quartile-error-correction QR image.
-pub fn encode_version(data: &[u8], version: u8) -> Result<GrayImage> {
-    if data.len() > frame::qr_byte_capacity(version) {
-        return Err(Error::Message("payload exceeds QR version".into()));
+fn too_long(version: u8, len: usize, why: &str) -> Error {
+    Error::Message(format!(
+        "payload exceeds QR v{version} ({len} bytes, {why})"
+    ))
+}
+
+fn qr_code_byte_mode(data: &[u8], version: u8) -> Result<QrCode> {
+    let cap = frame::qr_byte_capacity(version);
+    if data.len() > cap {
+        return Err(too_long(version, data.len(), &format!("max {cap}")));
     }
 
-    let code = QrCode::with_version(data, Version::Normal(version as i16), EcLevel::Q)
-        .map_err(|_| Error::Message("payload exceeds QR version".into()))?;
+    let mut bits = Bits::new(Version::Normal(version as i16));
+    bits.push_byte_data(data)
+        .map_err(|_| too_long(version, data.len(), "byte mode"))?;
+    bits.push_terminator(EcLevel::Q)
+        .map_err(|_| too_long(version, data.len(), "terminator"))?;
+    QrCode::with_bits(bits, EcLevel::Q).map_err(|_| too_long(version, data.len(), "encoder"))
+}
+
+/// Encodes `data` as a fixed-version, quartile-error-correction QR image.
+///
+/// Always uses byte mode. The payload is a binary envelope, and the optimizer
+/// in `QrCode::with_version` can pick a mixed-mode layout that no longer fits
+/// the bit budget we sized the chunks for.
+pub fn encode_version(data: &[u8], version: u8) -> Result<GrayImage> {
+    let code = qr_code_byte_mode(data, version)?;
     let modules = code.width() + QUIET_ZONE_MODULES * 2;
     let image_size = modules * MODULE_SCALE;
     let mut image = GrayImage::from_pixel(image_size as u32, image_size as u32, Luma([255]));
@@ -32,6 +52,26 @@ pub fn encode_version(data: &[u8], version: u8) -> Result<GrayImage> {
     }
 
     Ok(image)
+}
+
+/// Checks that a full-size DATA envelope fits in `version` under byte mode.
+///
+/// Call this after the link is locked and before GO, so a capacity mistake
+/// fails the handshake instead of crashing the sender while the receiver
+/// waits for DATA and reports a stall on sequences 0–31.
+pub fn ensure_full_data_frame_fits(version: u8) -> Result<()> {
+    let chunk = vec![0xA5u8; frame::data_chunk_size(version)];
+    let bytes = frame::encode(&frame::Payload::Data { seq: 0, chunk })?;
+    let cap = frame::qr_byte_capacity(version);
+    if bytes.len() > cap {
+        return Err(too_long(version, bytes.len(), &format!("max {cap}")));
+    }
+    let mut bits = Bits::new(Version::Normal(version as i16));
+    bits.push_byte_data(&bytes)
+        .map_err(|_| too_long(version, bytes.len(), "byte mode"))?;
+    bits.push_terminator(EcLevel::Q)
+        .map_err(|_| too_long(version, bytes.len(), "terminator"))?;
+    Ok(())
 }
 
 /// Total module count per side for `version`, including the quiet zone.
@@ -238,6 +278,33 @@ mod tests {
         let img = encode_version(&bytes, 15).unwrap();
         let got = decode_image(&img).unwrap();
         assert_eq!(got, bytes);
+    }
+
+    #[test]
+    fn a_full_data_chunk_fits_every_supported_version() {
+        for version in SUPPORTED_VERSIONS {
+            let cap = frame::qr_byte_capacity(version);
+            let chunk = vec![0xA5u8; frame::data_chunk_size(version)];
+            let bytes = frame::encode(&frame::Payload::Data { seq: 0, chunk }).unwrap();
+            assert!(
+                bytes.len() <= cap,
+                "v{version}: DATA envelope {} > capacity {cap}",
+                bytes.len()
+            );
+            encode_version(&bytes, version).unwrap_or_else(|err| {
+                panic!("v{version} full DATA chunk must encode, got {err}")
+            });
+            encode_version(&vec![0xFFu8; cap], version).unwrap_or_else(|err| {
+                panic!("v{version} capacity {cap} must encode, got {err}")
+            });
+            ensure_full_data_frame_fits(version).unwrap_or_else(|err| {
+                panic!("v{version} handshake preflight must pass, got {err}")
+            });
+            assert!(
+                encode_version(&vec![0xFFu8; cap + 1], version).is_err(),
+                "v{version} must reject capacity+1"
+            );
+        }
     }
 
     #[test]

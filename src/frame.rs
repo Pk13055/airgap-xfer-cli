@@ -81,16 +81,20 @@ pub enum Payload {
     Fail { reason: u8 },
 }
 
+/// Binary (byte-mode) payload capacity at Quartile ECC, matching what
+/// `qrcode` will actually encode, minus a few bytes of headroom so a full
+/// DATA envelope cannot miss the encoder's bit budget.
 pub fn qr_byte_capacity(version: u8) -> usize {
-    match version {
-        10 => 174,
+    let raw: usize = match version {
+        10 => 151,
         15 => 292,
-        20 => 415,
-        25 => 583,
-        30 => 709,
-        40 => 1273,
+        20 => 482,
+        25 => 715,
+        30 => 982,
+        40 => 1663,
         _ => 0,
-    }
+    };
+    raw.saturating_sub(8)
 }
 
 pub fn data_chunk_size(version: u8) -> usize {
@@ -335,13 +339,13 @@ mod tests {
 
     #[test]
     fn chunk_size_is_capacity_minus_fourteen() {
-        assert_eq!(qr_byte_capacity(10), 174);
-        assert_eq!(qr_byte_capacity(15), 292);
-        assert_eq!(qr_byte_capacity(20), 415);
-        assert_eq!(qr_byte_capacity(25), 583);
-        assert_eq!(qr_byte_capacity(30), 709);
-        assert_eq!(qr_byte_capacity(40), 1273);
-        assert_eq!(data_chunk_size(10), 174 - 14);
-        assert_eq!(data_chunk_size(40), 1273 - 14);
+        assert_eq!(qr_byte_capacity(10), 143);
+        assert_eq!(qr_byte_capacity(15), 284);
+        assert_eq!(qr_byte_capacity(20), 474);
+        assert_eq!(qr_byte_capacity(25), 707);
+        assert_eq!(qr_byte_capacity(30), 974);
+        assert_eq!(qr_byte_capacity(40), 1655);
+        assert_eq!(data_chunk_size(10), 143 - 14);
+        assert_eq!(data_chunk_size(40), 1655 - 14);
     }
 }
