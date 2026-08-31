@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
@@ -20,13 +21,45 @@ use crate::{detect::Tracker, frame::Payload, live::camera_error, Error, Result};
 /// 1080p luma frames into the UI thread every tick would cost megabytes a
 /// second for a picture that is at most a couple of hundred cells wide.
 const PREVIEW_WIDTH: u32 = 320;
+/// Unique payloads the protocol thread can lag by before we drop the oldest.
+/// Two ACK windows fit, so a slow paint cannot wipe a burst that already
+/// decoded.
+const DECODE_QUEUE: usize = 64;
+
+/// Consecutive identical camera reads collapse to one entry: the webcam
+/// re-reads whatever is on the peer's screen many times per displayed code.
+fn push_unique(slot: &mut DecodeSlot, payload: Payload) {
+    if slot.last.as_ref() == Some(&payload) {
+        return;
+    }
+    if slot.pending.len() >= DECODE_QUEUE {
+        slot.pending.pop_front();
+    }
+    slot.pending.push_back(payload.clone());
+    slot.last = Some(payload);
+}
+
+struct DecodeSlot {
+    pending: VecDeque<Payload>,
+    last: Option<Payload>,
+}
+
+impl Default for DecodeSlot {
+    fn default() -> Self {
+        Self {
+            pending: VecDeque::new(),
+            last: None,
+        }
+    }
+}
 
 #[derive(Default)]
 struct Shared {
-    /// Most recent successfully decoded payload, tagged with a monotonically
-    /// increasing sequence number so a consumer can tell a fresh decode from
-    /// one it has already taken.
-    decoded: Mutex<Option<(u64, Payload)>>,
+    /// Unique payloads in decode order. Consecutive identical reads are
+    /// collapsed so the protocol never consumes a seconds-old duplicate of
+    /// the code still on screen, but a new seq that arrived while it was
+    /// painting an ACK is still waiting.
+    decoded: Mutex<DecodeSlot>,
     decodes: AtomicU64,
     frames: AtomicU64,
     /// Exponential moving average of the gap between successful decodes, in
@@ -88,19 +121,13 @@ impl CameraFeed {
         )))
     }
 
-    /// Returns the latest decode if it is newer than `seen`, advancing `seen`.
+    /// Returns the next unique payload the camera has decoded, if any.
     ///
-    /// Only the newest decode is kept: the camera re-reads whatever is on the
-    /// peer's screen many times per displayed code, and a queue would let the
-    /// protocol consume seconds-old frames while believing it was current.
-    pub fn take_newer_than(&self, seen: &mut u64) -> Option<Payload> {
-        let slot = self.shared.decoded.lock().ok()?;
-        let (seq, payload) = slot.as_ref()?;
-        if *seq <= *seen {
-            return None;
-        }
-        *seen = *seq;
-        Some(payload.clone())
+    /// Consecutive identical reads of the same code are collapsed at enqueue
+    /// time, so this is a change in what the peer is showing, not another
+    /// look at the same QR.
+    pub fn take_next(&self) -> Option<Payload> {
+        self.shared.decoded.lock().ok()?.pending.pop_front()
     }
 
     pub fn preview(&self) -> Option<Arc<GrayImage>> {
@@ -149,7 +176,6 @@ fn capture_loop(index: u32, shared: &Shared) -> Result<()> {
     let mut camera = Camera::new(CameraIndex::Index(index), format).map_err(camera_error)?;
     camera.open_stream().map_err(camera_error)?;
 
-    let mut seq = 0u64;
     let mut last_decode: Option<std::time::Instant> = None;
     // The lids sit at different angles, so the peer's screen is a small
     // trapezoid somewhere in a wide frame. The tracker finds it once and then
@@ -174,7 +200,6 @@ fn capture_loop(index: u32, shared: &Shared) -> Result<()> {
         let Ok(payload) = crate::frame::decode(&bytes) else {
             continue;
         };
-        seq += 1;
         shared.decodes.fetch_add(1, Ordering::Relaxed);
         let now = std::time::Instant::now();
         if let Some(previous) = last_decode.replace(now) {
@@ -187,7 +212,7 @@ fn capture_loop(index: u32, shared: &Shared) -> Result<()> {
             shared.decode_gap_ms.store(smoothed.max(1), Ordering::Relaxed);
         }
         if let Ok(mut slot) = shared.decoded.lock() {
-            *slot = Some((seq, payload));
+            push_unique(&mut slot, payload);
         }
     }
     Ok(())
@@ -214,5 +239,52 @@ mod tests {
 
         let tiny = GrayImage::new(64, 48);
         assert_eq!(downscale(&tiny).dimensions(), (64, 48));
+    }
+
+    #[test]
+    fn consecutive_identical_payloads_collapse_but_a_change_is_queued() {
+        let mut slot = DecodeSlot::default();
+        let hello = Payload::Hello {
+            protocol_ver: 1,
+            role: 2,
+        };
+        let data0 = Payload::Data {
+            seq: 0,
+            chunk: vec![1],
+        };
+        let data1 = Payload::Data {
+            seq: 1,
+            chunk: vec![2],
+        };
+
+        push_unique(&mut slot, hello.clone());
+        push_unique(&mut slot, hello.clone());
+        push_unique(&mut slot, data0.clone());
+        push_unique(&mut slot, data0.clone());
+        push_unique(&mut slot, data1.clone());
+
+        assert_eq!(slot.pending, VecDeque::from([hello, data0, data1]));
+    }
+
+    #[test]
+    fn a_full_queue_drops_the_oldest_unique_payload() {
+        let mut slot = DecodeSlot::default();
+        for seq in 0..=DECODE_QUEUE as u32 {
+            push_unique(
+                &mut slot,
+                Payload::Data {
+                    seq,
+                    chunk: vec![seq as u8],
+                },
+            );
+        }
+        assert_eq!(slot.pending.len(), DECODE_QUEUE);
+        assert_eq!(
+            slot.pending.front(),
+            Some(&Payload::Data {
+                seq: 1,
+                chunk: vec![1]
+            })
+        );
     }
 }

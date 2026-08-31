@@ -19,8 +19,9 @@ use crate::{
 const SIZE_NOTE: &str = "Both terminals need at least 65x35 cells: the smallest usable QR code is \
 65x33 on its own, and a clipped code cannot be read by the other camera. The \
 layout drops its borders and transcript on short terminals to make room. \
-Transfers are turn based -- each side pauses at every phase and waits for \
-Enter (Esc declines, q quits).";
+Aim both cameras until tracking locks, then press Enter. After that the \
+handshake runs on its own. One Enter on the sender starts the file; the \
+receiver takes it without further keypresses. Esc aborts, q quits.";
 
 #[derive(Parser, Debug)]
 #[command(name = "airgap-xfer", version, after_help = SIZE_NOTE)]

@@ -50,9 +50,13 @@ pub enum UiEvent {
     Status(String),
     Log(String),
     /// Hold here until the operator answers on `reply`.
+    ///
+    /// When `require_lock` is set, Enter is ignored until the camera is
+    /// tracking the peer's screen — that is the only turn-based step.
     Gate {
         prompt: String,
         reply: Sender<GateReply>,
+        require_lock: bool,
     },
     /// The protocol finished; `summary` is the line to leave on screen.
     Finished { summary: String },
@@ -66,7 +70,6 @@ pub struct TuiOptical {
     events: Sender<UiEvent>,
     version: u8,
     invert: bool,
-    seen: u64,
 }
 
 impl TuiOptical {
@@ -76,7 +79,6 @@ impl TuiOptical {
             events,
             version: 10,
             invert,
-            seen: 0,
         }
     }
 
@@ -84,6 +86,28 @@ impl TuiOptical {
         self.events
             .send(event)
             .map_err(|_| display_closed())
+    }
+
+    fn gate_inner(&mut self, prompt: &str, require_lock: bool) -> Result<bool> {
+        check_interrupted()?;
+        let (reply, reply_rx) = std::sync::mpsc::channel();
+        self.send(UiEvent::Gate {
+            prompt: prompt.to_string(),
+            reply,
+            require_lock,
+        })?;
+
+        loop {
+            check_interrupted()?;
+            match reply_rx.recv_timeout(POLL_TICK) {
+                Ok(GateReply::Proceed) => return Ok(true),
+                Ok(GateReply::Abort) => return Ok(false),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(display_closed())
+                }
+            }
+        }
     }
 }
 
@@ -166,24 +190,11 @@ impl Optical for TuiOptical {
     }
 
     fn gate(&mut self, prompt: &str) -> Result<bool> {
-        check_interrupted()?;
-        let (reply, reply_rx) = std::sync::mpsc::channel();
-        self.send(UiEvent::Gate {
-            prompt: prompt.to_string(),
-            reply,
-        })?;
+        self.gate_inner(prompt, false)
+    }
 
-        loop {
-            check_interrupted()?;
-            match reply_rx.recv_timeout(POLL_TICK) {
-                Ok(GateReply::Proceed) => return Ok(true),
-                Ok(GateReply::Abort) => return Ok(false),
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    return Err(display_closed())
-                }
-            }
-        }
+    fn gate_locked(&mut self, prompt: &str) -> Result<bool> {
+        self.gate_inner(prompt, true)
     }
 
     fn poll(&mut self, timeout: Duration) -> Result<Option<Payload>> {
@@ -194,7 +205,7 @@ impl Optical for TuiOptical {
             if let Some(err) = self.camera.failure() {
                 return Err(Error::Camera(err));
             }
-            if let Some(payload) = self.camera.take_newer_than(&mut self.seen) {
+            if let Some(payload) = self.camera.take_next() {
                 return Ok(Some(payload));
             }
             if Instant::now() >= deadline {

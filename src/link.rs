@@ -27,8 +27,6 @@ pub struct LinkConfig {
     /// Shortens HELLO/LINK/GO timeouts to 100/50/50 ms, quiet time to 20 ms,
     /// and skips probe dwell sleeps.
     pub fast: bool,
-    /// Pauses at each phase boundary for an operator confirmation.
-    pub gates: bool,
     /// Stretches the HELLO/LINK/GO timeouts to [`GATED_TIMEOUT`]. Set whenever
     /// the peer might be slow to arrive — a human reading the screen, or a
     /// stalled peer still working through its own retry — which is every
@@ -51,7 +49,6 @@ impl Default for LinkConfig {
     fn default() -> Self {
         Self {
             fast: false,
-            gates: false,
             patient: false,
             max_qr_version: 40,
             dwell_floor_ms: 0,
@@ -68,19 +65,11 @@ impl LinkConfig {
         }
     }
 
-    /// Turn-based gates on top of another config, keeping its timeouts.
-    pub fn with_gates(self) -> Self {
-        Self {
-            gates: true,
-            ..self
-        }
-    }
-
-    /// The first, interactive attempt: turn-based gates, generous timeouts,
-    /// and QR versions capped to what this terminal can draw.
+    /// The first, interactive attempt: generous timeouts so a human can aim,
+    /// and QR versions capped to what this terminal can draw. Handshake phases
+    /// themselves do not wait for Enter.
     pub fn gated(max_qr_version: u8) -> Self {
         Self {
-            gates: true,
             patient: true,
             max_qr_version,
             ..Self::default()
@@ -242,9 +231,6 @@ pub fn run_send_handshake(
         return Err(Error::HandshakeTimeout);
     }
     opt.log("receiver said HELLO");
-    if cfg.gates && !opt.gate("Receiver found. Enter to run link probes")? {
-        return Err(Error::Aborted);
-    }
 
     // Probes above what this terminal can draw would render clipped and
     // never decode, so they are dropped rather than offered.
@@ -292,9 +278,6 @@ pub fn run_send_handshake(
     opt.log(&format!(
         "linked at QR v{qr_version}, {dwell_ms} ms dwell"
     ));
-    if cfg.gates && !opt.gate(&format!("Linked at QR v{qr_version}. Enter to offer the file"))? {
-        return Err(Error::Aborted);
-    }
 
     let chunk_size = data_chunk_size(qr_version);
     if chunk_size == 0 {
@@ -455,13 +438,6 @@ pub fn run_recv_handshake(
     opt.log(&format!(
         "sender found: best readable QR v{qr_version}, {probe_loss}% probe loss"
     ));
-    if cfg.gates
-        && !opt.gate(&format!(
-            "Sender found at QR v{qr_version} ({probe_loss}% probe loss). Enter to accept the link"
-        ))?
-    {
-        return Err(Error::Aborted);
-    }
 
     opt.show(&Payload::Link {
         qr_version,
@@ -500,17 +476,6 @@ pub fn run_recv_handshake(
     opt.log(&format!(
         "offer: {basename}, {compressed_size} B compressed, {chunk_count} chunks"
     ));
-    if cfg.gates
-        && !opt.gate(&format!(
-            "Incoming {basename} ({compressed_size} B, {chunk_count} chunks) into {}. Enter to accept",
-            outdir.display()
-        ))?
-    {
-        opt.show(&Payload::Fail {
-            reason: FAIL_ABORTED,
-        })?;
-        return Err(Error::Aborted);
-    }
 
     opt.show(&Payload::Ack {
         window_base: 0,
@@ -572,12 +537,10 @@ mod tests {
         }
     }
 
-    /// Wraps a channel end, recording every gate prompt and optionally
-    /// declining the nth one.
+    /// Wraps a channel end, recording every log line and payload shown.
     struct Gated<T> {
         inner: T,
-        prompts: Arc<Mutex<Vec<String>>>,
-        decline_at: Option<usize>,
+        logs: Arc<Mutex<Vec<String>>>,
         shown: Arc<Mutex<Vec<Payload>>>,
     }
 
@@ -595,26 +558,23 @@ mod tests {
             self.inner.set_version(version)
         }
 
-        fn gate(&mut self, prompt: &str) -> Result<bool> {
-            let mut prompts = self.prompts.lock().unwrap();
-            prompts.push(prompt.to_string());
-            Ok(self.decline_at != Some(prompts.len() - 1))
+        fn log(&mut self, line: &str) {
+            self.logs.lock().unwrap().push(line.to_string());
         }
     }
 
     type Recorded<T> = Arc<Mutex<Vec<T>>>;
 
     fn gated<T>(inner: T) -> (Gated<T>, Recorded<String>, Recorded<Payload>) {
-        let prompts = Arc::new(Mutex::new(Vec::new()));
+        let logs = Arc::new(Mutex::new(Vec::new()));
         let shown = Arc::new(Mutex::new(Vec::new()));
         (
             Gated {
                 inner,
-                prompts: Arc::clone(&prompts),
-                decline_at: None,
+                logs: Arc::clone(&logs),
                 shown: Arc::clone(&shown),
             },
-            prompts,
+            logs,
             shown,
         )
     }
@@ -698,11 +658,11 @@ mod tests {
     }
 
     #[test]
-    fn each_side_stops_for_the_operator_once_per_phase() {
+    fn handshake_does_not_stop_for_the_operator() {
         let (send_end, recv_end) = pair();
-        let (mut send_opt, send_prompts, _) = gated(send_end);
-        let (mut recv_opt, recv_prompts, _) = gated(recv_end);
-        let cfg = LinkConfig::fast().with_gates();
+        let (mut send_opt, send_logs, _) = gated(send_end);
+        let (mut recv_opt, recv_logs, _) = gated(recv_end);
+        let cfg = LinkConfig::fast();
 
         let send_t = thread::spawn(move || {
             run_send_handshake(&mut send_opt, "dir".into(), 10, &[1u8, 2, 3], [7; 32], cfg).unwrap()
@@ -713,42 +673,25 @@ mod tests {
         send_t.join().unwrap();
         recv_t.join().unwrap();
 
-        // Sender: peer found, then link negotiated. Receiver: sender found,
-        // then the incoming file offer.
-        let send_prompts = send_prompts.lock().unwrap().clone();
-        assert_eq!(send_prompts.len(), 2, "{send_prompts:?}");
-        assert!(send_prompts[0].contains("Receiver found"));
-        assert!(send_prompts[1].contains("Linked at QR v"));
-
-        let recv_prompts = recv_prompts.lock().unwrap().clone();
-        assert_eq!(recv_prompts.len(), 2, "{recv_prompts:?}");
-        assert!(recv_prompts[0].contains("Sender found"));
-        assert!(recv_prompts[1].contains("Incoming dir"));
-    }
-
-    #[test]
-    fn declining_the_offer_tells_the_sender_and_aborts() {
-        let (send_end, recv_end) = pair();
-        let (mut send_opt, _, _) = gated(send_end);
-        let (mut recv_opt, _, recv_shown) = gated(recv_end);
-        recv_opt.decline_at = Some(1); // the incoming-file prompt
-        let cfg = LinkConfig::fast().with_gates();
-
-        let send_t = thread::spawn(move || {
-            run_send_handshake(&mut send_opt, "dir".into(), 10, &[1u8, 2, 3], [7; 32], cfg)
-        });
-        let err = run_recv_handshake(&mut recv_opt, &scratch_dir("gate-no"), false, cfg).unwrap_err();
-        assert!(matches!(err, Error::Aborted), "{err:?}");
+        let send_logs = send_logs.lock().unwrap().clone();
         assert!(
-            recv_shown.lock().unwrap().iter().any(|payload| matches!(
-                payload,
-                Payload::Fail {
-                    reason: FAIL_ABORTED
-                }
-            )),
-            "the sender must be told, not left waiting"
+            send_logs.iter().any(|line| line.contains("receiver said HELLO")),
+            "{send_logs:?}"
         );
-        assert!(send_t.join().unwrap().is_err());
+        assert!(
+            send_logs.iter().any(|line| line.contains("linked at QR v")),
+            "{send_logs:?}"
+        );
+
+        let recv_logs = recv_logs.lock().unwrap().clone();
+        assert!(
+            recv_logs.iter().any(|line| line.contains("sender found")),
+            "{recv_logs:?}"
+        );
+        assert!(
+            recv_logs.iter().any(|line| line.contains("offer: dir")),
+            "{recv_logs:?}"
+        );
     }
 
     #[test]
@@ -756,12 +699,11 @@ mod tests {
         let (send_end, recv_end) = pair();
         let cfg = LinkConfig {
             fast: true,
-            gates: true,
             max_qr_version: 15,
             ..LinkConfig::default()
         };
         let (mut send_opt, _, send_shown) = gated(send_end);
-        let (mut recv_opt, recv_prompts, _) = gated(recv_end);
+        let (mut recv_opt, recv_logs, _) = gated(recv_end);
 
         let send_t = thread::spawn(move || {
             run_send_handshake(&mut send_opt, "dir".into(), 10, &[1u8, 2, 3], [7; 32], cfg).unwrap()
@@ -782,8 +724,11 @@ mod tests {
         );
         // The four probes above v15 were never on the table, so they are not
         // losses: a clean capped link must report 0%, not 66%.
-        let prompt = recv_prompts.lock().unwrap()[0].clone();
-        assert!(prompt.contains("(0% probe loss)"), "{prompt}");
+        let logs = recv_logs.lock().unwrap().clone();
+        assert!(
+            logs.iter().any(|line| line.contains("0% probe loss")),
+            "{logs:?}"
+        );
     }
 
     #[test]

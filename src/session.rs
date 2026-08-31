@@ -30,10 +30,11 @@ pub struct Completed {
 
 /// The link and transport settings for attempt `n`.
 ///
-/// The first attempt is the interactive one: it stops at each phase boundary
-/// for the operator. Every retry runs unattended — having committed to the
-/// transfer once, being asked to re-confirm each rung of the ladder would
-/// defeat the point of retrying automatically.
+/// The first attempt is the interactive one: it waits for the operator to
+/// confirm aiming, then (on the sender) to start the file. Handshake phases
+/// and the receive side run unattended. Every retry is fully unattended —
+/// having committed to the transfer once, being asked to re-confirm each
+/// rung of the ladder would defeat the point of retrying automatically.
 pub fn configs_for(attempt: usize, terminal_max: u8) -> (LinkConfig, TransportConfig, Attempt) {
     let plan = link::attempt_plan(attempt, terminal_max);
     let link_cfg = if attempt == 0 {
@@ -326,11 +327,16 @@ mod tests {
     #[test]
     fn only_the_first_attempt_asks_the_operator_anything() {
         let (first_link, first_transport, _) = configs_for(0, 40);
-        assert!(first_link.gates);
-        assert!(first_transport.gated);
+        assert!(
+            first_link.patient,
+            "the first attempt still waits for a human to aim"
+        );
+        assert!(
+            first_transport.gated,
+            "the sender confirms once before the file goes"
+        );
         for attempt in 1..MAX_ATTEMPTS {
             let (link_cfg, transport_cfg, _) = configs_for(attempt, 40);
-            assert!(!link_cfg.gates, "attempt {attempt} must not prompt");
             assert!(!transport_cfg.gated, "attempt {attempt} must not prompt");
             assert!(
                 link_cfg.patient,

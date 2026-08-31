@@ -47,7 +47,34 @@ fn ack_timeout(cfg: TransportConfig) -> Duration {
     if cfg.fast {
         Duration::from_millis(50)
     } else {
-        Duration::from_secs(2)
+        // Must outlast the receiver's post-burst quiet wait (1.5× dwell, up to
+        // ~1.8s) plus the time to encode and paint the ACK QR.
+        Duration::from_secs(5)
+    }
+}
+
+/// How long the receiver waits for another *new* sequence before concluding
+/// the sender has finished the burst and wants an ACK.
+///
+/// Live cameras re-decode the code currently on screen many times a second, so
+/// "poll returned None" never happens while a DATA frame is held. The quiet
+/// timer is measured from the last new seq instead. Fast in-process tests have
+/// no duplicates and ACK as soon as the channel goes idle.
+fn burst_quiet(cfg: TransportConfig, dwell_ms: u16) -> Duration {
+    if cfg.fast {
+        Duration::ZERO
+    } else {
+        Duration::from_millis((u64::from(dwell_ms) * 3 / 2).max(80))
+    }
+}
+
+/// Live transfers wait this long for the first DATA: the sender still has one
+/// Enter to press after the handshake, and that is not a stall.
+fn first_data_budget(cfg: TransportConfig) -> Duration {
+    if cfg.fast {
+        ack_timeout(cfg) * STALL_LIMIT
+    } else {
+        Duration::from_secs(600)
     }
 }
 
@@ -78,6 +105,16 @@ fn missing_seqs(base: u32, end: u32, bitmap: u32) -> Vec<u32> {
     (base..end)
         .filter(|seq| bitmap & (1 << (seq - base)) == 0)
         .collect()
+}
+
+fn window_bitmap(got: &HashSet<u32>, base: u32, end: u32) -> u32 {
+    (base..end).fold(0, |bits, candidate| {
+        bits | if got.contains(&candidate) {
+            1 << (candidate - base)
+        } else {
+            0
+        }
+    })
 }
 
 fn show_data(
@@ -214,6 +251,18 @@ pub fn send_blob(
     Err(Error::HandshakeFailed)
 }
 
+fn emit_ack(
+    opt: &mut impl Optical,
+    got: &HashSet<u32>,
+    base: u32,
+    end: u32,
+) -> Result<()> {
+    opt.show(&Payload::Ack {
+        window_base: base,
+        bitmap: window_bitmap(got, base, end),
+    })
+}
+
 pub fn recv_blob(
     opt: &mut impl Optical,
     session: &Session,
@@ -234,31 +283,41 @@ pub fn recv_blob(
     let mut base = 0;
     let start_time = Instant::now();
     let mut idle_polls: u32 = 0;
+    let mut last_new = Instant::now();
+    let mut unacked = false;
+    let mut seen_data = false;
+    let mut last_old_window: Option<u32> = None;
+    let quiet = burst_quiet(cfg, session.dwell_ms);
 
     loop {
-        match opt.poll(ack_timeout(cfg))? {
+        let end = (base + WINDOW).min(chunk_count);
+        let poll_for = if seen_data && unacked && !cfg.fast {
+            quiet
+                .saturating_sub(last_new.elapsed())
+                .max(Duration::from_millis(5))
+        } else {
+            ack_timeout(cfg)
+        };
+
+        match opt.poll(poll_for)? {
             Some(Payload::Data { seq, chunk }) => {
                 idle_polls = 0;
-                let end = (base + WINDOW).min(chunk_count);
                 if seq < base {
                     if got.contains(&seq) {
                         let window_base = seq / WINDOW * WINDOW;
-                        let window_end = (window_base + WINDOW).min(chunk_count);
-                        let bitmap = (window_base..window_end).fold(0, |bits, candidate| {
-                            bits | if got.contains(&candidate) {
-                                1 << (candidate - window_base)
-                            } else {
-                                0
-                            }
-                        });
-                        opt.show(&Payload::Ack {
-                            window_base,
-                            bitmap,
-                        })?;
+                        if last_old_window != Some(window_base) {
+                            let window_end = (window_base + WINDOW).min(chunk_count);
+                            emit_ack(opt, &got, window_base, window_end)?;
+                            last_old_window = Some(window_base);
+                        }
                     }
                     continue;
                 }
                 if seq >= end || got.contains(&seq) {
+                    if unacked && last_new.elapsed() >= quiet {
+                        emit_ack(opt, &got, base, end)?;
+                        unacked = false;
+                    }
                     continue;
                 }
 
@@ -269,21 +328,21 @@ pub fn recv_blob(
                 }
                 got.insert(seq);
                 blob[start..start + expected_len].copy_from_slice(&chunk);
-                let bitmap = (base..end).fold(0, |bits, candidate| {
-                    bits | if got.contains(&candidate) {
-                        1 << (candidate - base)
-                    } else {
-                        0
-                    }
-                });
+                seen_data = true;
+                unacked = true;
+                last_new = Instant::now();
                 let holes = (base..end).filter(|c| !got.contains(c)).count();
-                opt.set_status(&status_line(base, end, chunk_count, holes, start_time.elapsed()));
-                opt.show(&Payload::Ack {
-                    window_base: base,
-                    bitmap,
-                })?;
+                opt.set_status(&status_line(
+                    base,
+                    end,
+                    chunk_count,
+                    holes,
+                    start_time.elapsed(),
+                ));
 
                 if (base..end).all(|candidate| got.contains(&candidate)) {
+                    emit_ack(opt, &got, base, end)?;
+                    unacked = false;
                     base = end;
                 }
             }
@@ -303,20 +362,30 @@ pub fn recv_blob(
                 return Ok(blob);
             }
             Some(_) | None => {
-                idle_polls += 1;
-                if idle_polls >= STALL_LIMIT {
-                    let end = (base + WINDOW).min(chunk_count);
-                    return Err(Error::Stalled(missing_seqs(
-                        base,
-                        end,
-                        (base..end).fold(0, |bits, candidate| {
-                            bits | if got.contains(&candidate) {
-                                1 << (candidate - base)
-                            } else {
-                                0
-                            }
-                        }),
-                    )));
+                if unacked && last_new.elapsed() >= quiet {
+                    emit_ack(opt, &got, base, end)?;
+                    unacked = false;
+                    continue;
+                }
+                if !seen_data {
+                    if start_time.elapsed() >= first_data_budget(cfg) {
+                        return Err(Error::Stalled(missing_seqs(
+                            base,
+                            end,
+                            window_bitmap(&got, base, end),
+                        )));
+                    }
+                    continue;
+                }
+                if !unacked {
+                    idle_polls += 1;
+                    if idle_polls >= STALL_LIMIT {
+                        return Err(Error::Stalled(missing_seqs(
+                            base,
+                            end,
+                            window_bitmap(&got, base, end),
+                        )));
+                    }
                 }
             }
         }
@@ -398,6 +467,24 @@ mod tests {
         }
     }
 
+    /// Drops anything the peer sent while this side was encoding a frame —
+    /// the live camera's "only the latest decode" behaviour, which used to
+    /// throw away a DATA burst every time the receiver painted an ACK.
+    struct DropInboundWhileShowing<T> {
+        inner: T,
+    }
+
+    impl<T: Optical> Optical for DropInboundWhileShowing<T> {
+        fn show(&mut self, payload: &Payload) -> Result<()> {
+            while matches!(self.inner.poll(Duration::ZERO), Ok(Some(_))) {}
+            self.inner.show(payload)
+        }
+
+        fn poll(&mut self, timeout: Duration) -> Result<Option<Payload>> {
+            self.inner.poll(timeout)
+        }
+    }
+
     #[test]
     fn the_operator_confirms_once_before_the_first_chunk_not_once_per_chunk() {
         let blob: Vec<u8> = (0..2000u32).map(|i| i as u8).collect();
@@ -460,6 +547,27 @@ mod tests {
             s.data_shown, 0,
             "a declined transfer must not blast frames at a receiver that moved on"
         );
+    }
+
+    #[test]
+    fn acking_must_not_drop_the_rest_of_the_window() {
+        let blob: Vec<u8> = (0..2000u32).map(|i| i as u8).collect();
+        let sess = session_for(&blob, 10);
+        let (mut s, r) = pair();
+        let mut r = DropInboundWhileShowing { inner: r };
+        let cfg = TransportConfig::fast();
+        let st = thread::spawn({
+            let blob = blob.clone();
+            let sess = sess.clone();
+            move || send_blob(&mut s, &sess, &blob, cfg).unwrap()
+        });
+        let rt = thread::spawn(move || {
+            let blob = recv_blob(&mut r, &sess, cfg).unwrap();
+            r.show(&Payload::Ok).unwrap();
+            blob
+        });
+        st.join().unwrap();
+        assert_eq!(rt.join().unwrap(), blob);
     }
 
     #[test]

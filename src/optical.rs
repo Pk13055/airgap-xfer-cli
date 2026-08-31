@@ -39,12 +39,17 @@ pub trait Optical {
     /// Blocks until the operator confirms the upcoming phase described by
     /// `prompt`, returning `Ok(true)` to proceed and `Ok(false)` to abort.
     ///
-    /// Turn taking is what makes the two terminals legible to a human: each
-    /// side pauses at a phase boundary so the operator can see what the peer
-    /// just said before committing to the next step. Non-interactive channels
-    /// (the in-process test pair) proceed automatically.
+    /// Used for the sender's one "send the file" confirmation after the
+    /// link is up. Aiming uses [`Optical::gate_locked`] instead.
     fn gate(&mut self, _prompt: &str) -> Result<bool> {
         Ok(true)
+    }
+
+    /// Like [`Optical::gate`], but the UI ignores Enter until the camera is
+    /// tracking the peer. Default is an ordinary gate, which in-process tests
+    /// auto-accept.
+    fn gate_locked(&mut self, prompt: &str) -> Result<bool> {
+        self.gate(prompt)
     }
 }
 

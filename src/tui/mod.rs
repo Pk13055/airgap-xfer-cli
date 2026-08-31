@@ -6,10 +6,10 @@
 //! exactly one cell per module on a forced white ground, a camera preview to
 //! aim with, and a transcript of the phases.
 //!
-//! The transfer is turn based. The protocol runs on a worker thread and pauses
-//! at each phase boundary until the operator presses Enter, so the two
-//! terminals alternate: one side commits, the other sees the result and
-//! commits in turn.
+//! The transfer is not turn-based after aiming. Enter is required to confirm
+//! that the camera is tracking the other terminal, and once more on the sender
+//! to start the file. Handshake probes, ACKs, and the receive side then run
+//! unattended.
 
 pub mod camera;
 pub mod optical;
@@ -146,7 +146,7 @@ struct Ui {
     label: String,
     status: String,
     log: Vec<String>,
-    gate: Option<(String, mpsc::Sender<GateReply>)>,
+    gate: Option<(String, mpsc::Sender<GateReply>, bool)>,
     done: Option<String>,
 }
 
@@ -183,8 +183,8 @@ where
         let mut optical = TuiOptical::new(worker_feed, events_tx.clone(), no_invert);
         let confirmed = {
             use crate::optical::Optical;
-            optical.gate(&format!(
-                "Camera {camera_index} is live. Aim it at the other terminal, then press Enter to lock in this device"
+            optical.gate_locked(&format!(
+                "Aim camera {camera_index} at the other terminal until tracking locks, then press Enter"
             ))
         };
         let result = match confirmed {
@@ -302,12 +302,19 @@ fn event_loop<B: ratatui::backend::Backend>(
                 }
                 match key.code {
                     KeyCode::Enter => {
-                        if let Some((_, reply)) = ui.gate.take() {
-                            let _ = reply.send(GateReply::Proceed);
+                        let allow = match &ui.gate {
+                            Some((_, _, true)) => feed.locked(),
+                            Some((_, _, false)) => true,
+                            None => false,
+                        };
+                        if allow {
+                            if let Some((_, reply, _)) = ui.gate.take() {
+                                let _ = reply.send(GateReply::Proceed);
+                            }
                         }
                     }
                     KeyCode::Esc => {
-                        if let Some((_, reply)) = ui.gate.take() {
+                        if let Some((_, reply, _)) = ui.gate.take() {
                             let _ = reply.send(GateReply::Abort);
                         }
                     }
@@ -344,8 +351,12 @@ fn event_loop<B: ratatui::backend::Backend>(
                     ui.push_log(line);
                     dirty = true;
                 }
-                Ok(UiEvent::Gate { prompt, reply }) => {
-                    ui.gate = Some((prompt, reply));
+                Ok(UiEvent::Gate {
+                    prompt,
+                    reply,
+                    require_lock,
+                }) => {
+                    ui.gate = Some((prompt, reply, require_lock));
                     dirty = true;
                 }
                 Ok(UiEvent::Finished { summary }) => {
@@ -505,12 +516,23 @@ fn draw(
 
     let hints = match (&ui.done, &ui.gate) {
         (Some(_), _) => "any key: exit",
+        (None, Some((_, _, true))) if !status.locked => {
+            "keep aiming until ● tracking   Esc: abort   q: quit"
+        }
         (None, Some(_)) => "Enter: continue   Esc: abort   q: quit",
         (None, None) => "q: quit",
     };
     let (prompt_style, mut prompt) = match (&ui.done, &ui.gate) {
         (Some(summary), _) => (Style::new().fg(Color::Cyan), summary.clone()),
-        (None, Some((text, _))) => (
+        (None, Some((_, _, true))) if !status.locked => (
+            Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            "▶ Aim at the other terminal until tracking locks, then press Enter".into(),
+        ),
+        (None, Some((text, _, true))) if status.locked => (
+            Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
+            format!("▶ Tracking locked. {text}"),
+        ),
+        (None, Some((text, _, _))) => (
             Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
             format!("▶ {text}"),
         ),
@@ -533,7 +555,7 @@ fn draw(
         .wrap(Wrap { trim: true });
     frame.render_widget(
         if chrome.prompt > 1 {
-            prompt_widget.block(Block::default().borders(Borders::ALL).title(" your turn "))
+            prompt_widget.block(Block::default().borders(Borders::ALL).title(" prompt "))
         } else {
             prompt_widget
         },
