@@ -117,18 +117,24 @@ fn show_data(
     opt: &mut impl Optical,
     blob: &[u8],
     chunk_size: usize,
-    base: u32,
-    end: u32,
+    seqs: &[u32],
     cfg: TransportConfig,
     dwell_ms: u16,
 ) -> Result<()> {
-    for seq in base..end {
-        let start = seq as usize * chunk_size;
-        let end = (start + chunk_size).min(blob.len());
-        opt.show(&Payload::Data {
-            seq,
-            chunk: blob[start..end].to_vec(),
-        })?;
+    let tiles = opt.tile_count().max(1);
+    for batch in seqs.chunks(tiles) {
+        let payloads: Vec<Payload> = batch
+            .iter()
+            .map(|&seq| {
+                let start = seq as usize * chunk_size;
+                let end = (start + chunk_size).min(blob.len());
+                Payload::Data {
+                    seq,
+                    chunk: blob[start..end].to_vec(),
+                }
+            })
+            .collect();
+        opt.show_many(&payloads)?;
         if !cfg.fast {
             thread::sleep(Duration::from_millis(dwell_ms.into()));
         }
@@ -159,8 +165,7 @@ pub fn send_blob(
             opt,
             blob,
             chunk_size,
-            base,
-            end,
+            &(base..end).collect::<Vec<_>>(),
             cfg,
             session.dwell_ms,
         )?;
@@ -211,17 +216,14 @@ pub fn send_blob(
                 missing.len(),
                 start_time.elapsed(),
             ));
-            for seq in missing {
-                let start = seq as usize * chunk_size;
-                let end = (start + chunk_size).min(blob.len());
-                opt.show(&Payload::Data {
-                    seq,
-                    chunk: blob[start..end].to_vec(),
-                })?;
-                if !cfg.fast {
-                    thread::sleep(Duration::from_millis(session.dwell_ms.into()));
-                }
-            }
+            show_data(
+                opt,
+                blob,
+                chunk_size,
+                &missing,
+                cfg,
+                session.dwell_ms,
+            )?;
         }
         base = end;
     }

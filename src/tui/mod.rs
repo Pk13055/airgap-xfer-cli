@@ -40,7 +40,7 @@ use crate::{
     tui::{
         camera::CameraFeed,
         optical::{GateReply, TuiOptical, UiEvent},
-        widget::{PreviewWidget, QrWidget},
+        widget::{PreviewWidget, QrGridWidget, QrWidget},
     },
     Error, Result,
 };
@@ -157,13 +157,16 @@ struct Ui {
     /// for it from the first draw, so the layout does not lurch when the first
     /// QR appears or when a smaller version is negotiated.
     max_version: u8,
-    image: Option<Arc<GrayImage>>,
+    images: Vec<Arc<GrayImage>>,
     invert: bool,
     label: String,
     status: String,
     log: Vec<String>,
     gate: Option<Gate>,
     done: Option<String>,
+    /// After the link: no camera preview, no transcript — the QR grid takes
+    /// the rest of the screen.
+    compact: bool,
 }
 
 impl Ui {
@@ -229,13 +232,14 @@ where
             title: title.to_string(),
             camera_index,
             max_version,
-            image: None,
+            images: Vec::new(),
             invert: no_invert,
             label: String::new(),
             status: String::new(),
             log: Vec::new(),
             gate: None,
             done: None,
+            compact: false,
         },
         &events_rx,
     );
@@ -353,14 +357,16 @@ fn event_loop<B: ratatui::backend::Backend>(
         loop {
             match events.try_recv() {
                 Ok(UiEvent::Show {
-                    image,
+                    images,
                     invert,
                     label,
+                    compact,
                     drawn,
                 }) => {
-                    ui.image = Some(image);
+                    ui.images = images;
                     ui.invert = invert;
                     ui.label = label;
+                    ui.compact = compact;
                     pending_draw_ack = Some(drawn);
                     dirty = true;
                     break;
@@ -444,7 +450,16 @@ fn draw(
 ) {
     let area = frame.area();
     let (qr_cols, qr_rows) = qr::cell_size_for_version(ui.max_version);
-    let chrome = Chrome::fit(area.width, area.height, qr_cols, qr_rows);
+    let chrome = if ui.compact {
+        Chrome {
+            qr_border: 0,
+            log: 0,
+            prompt: 1,
+            footer: 0,
+        }
+    } else {
+        Chrome::fit(area.width, area.height, qr_cols, qr_rows)
+    };
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -489,11 +504,11 @@ fn draw(
         rows[0],
     );
 
-    // Give the QR pane exactly the cells its code needs; whatever is left goes
-    // to the preview, which is dropped entirely when the terminal is narrow.
+    // After the link the camera preview goes away so the codes can use the
+    // full width. During aiming, leftover columns become the preview.
     let needed_cols = qr_cols + chrome.qr_border;
     let spare = rows[1].width.saturating_sub(needed_cols);
-    let middle = if spare >= MIN_PREVIEW_COLS {
+    let middle = if !ui.compact && spare >= MIN_PREVIEW_COLS {
         Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Length(needed_cols), Constraint::Min(0)])
@@ -515,15 +530,25 @@ fn draw(
     } else {
         middle[0]
     };
-    frame.render_widget(
-        QrWidget {
-            image: ui.image.as_deref(),
-            invert: ui.invert,
-        },
-        qr_area,
-    );
+    if ui.images.len() > 1 {
+        frame.render_widget(
+            QrGridWidget {
+                images: &ui.images,
+                invert: ui.invert,
+            },
+            qr_area,
+        );
+    } else {
+        frame.render_widget(
+            QrWidget {
+                image: ui.images.first().map(|img| img.as_ref()),
+                invert: ui.invert,
+            },
+            qr_area,
+        );
+    }
 
-    if middle.len() > 1 {
+    if middle.len() > 1 && !ui.compact {
         let preview_area = if chrome.qr_border > 0 {
             let block = Block::default().borders(Borders::ALL).title(" camera ");
             let inner = block.inner(middle[1]);

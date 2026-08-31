@@ -5,6 +5,7 @@ use ratatui::{
     style::{Color, Style},
     widgets::{Paragraph, Widget, Wrap},
 };
+use std::sync::Arc;
 
 use crate::qr;
 
@@ -76,6 +77,73 @@ impl Widget for QrWidget<'_> {
                     cell.set_char(half_block(upper, lower)).set_style(quiet);
                 }
             }
+        }
+    }
+}
+
+/// Several QR codes packed into one pane, used after the link when the
+/// camera preview is gone and leftover cells hold extra DATA frames.
+pub struct QrGridWidget<'a> {
+    pub images: &'a [Arc<GrayImage>],
+    pub invert: bool,
+}
+
+impl Widget for QrGridWidget<'_> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        if area.width == 0 || area.height == 0 || self.images.is_empty() {
+            return;
+        }
+        let quiet = Style::new().bg(Color::White).fg(Color::Black);
+        for y in area.top()..area.bottom() {
+            for x in area.left()..area.right() {
+                if let Some(cell) = buf.cell_mut((x, y)) {
+                    cell.set_char(' ').set_style(quiet);
+                }
+            }
+        }
+
+        let Some(first) = self.images.first() else {
+            return;
+        };
+        let modules = qr::modules_of(first);
+        let tile_w = modules as u16;
+        let tile_h = modules.div_ceil(2) as u16;
+        if tile_w == 0 || tile_h == 0 {
+            return;
+        }
+        let n = self.images.len() as u16;
+        let across = (area.width / tile_w).max(1).min(n);
+        let down = n.div_ceil(across);
+        let grid_w = across.saturating_mul(tile_w);
+        let grid_h = down.saturating_mul(tile_h);
+        if grid_w > area.width || grid_h > area.height {
+            Paragraph::new(format!(
+                "QR grid needs {grid_w}x{grid_h} cells, pane is {}x{}.\nEnlarge the terminal.",
+                area.width, area.height
+            ))
+            .style(quiet)
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true })
+            .render(area, buf);
+            return;
+        }
+
+        let origin_x = area.x + (area.width - grid_w) / 2;
+        let origin_y = area.y + (area.height - grid_h) / 2;
+        for (i, image) in self.images.iter().enumerate() {
+            let col = i as u16 % across;
+            let row = i as u16 / across;
+            let cell = Rect {
+                x: origin_x + col * tile_w,
+                y: origin_y + row * tile_h,
+                width: tile_w,
+                height: tile_h,
+            };
+            QrWidget {
+                image: Some(image.as_ref()),
+                invert: self.invert,
+            }
+            .render(cell, buf);
         }
     }
 }

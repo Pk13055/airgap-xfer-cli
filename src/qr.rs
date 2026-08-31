@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use image::{GrayImage, Luma};
 use qrcode::bits::Bits;
 use qrcode::{Color, EcLevel, QrCode, Version};
@@ -110,6 +112,19 @@ pub fn max_version_for_area(cols: u16, rows: u16) -> Option<u8> {
         })
 }
 
+/// How many copies of `version` fit in a `cols` x `rows` pane, packed in a
+/// row-major grid. Always at least 1: a pane smaller than one code is a
+/// clip (handled at draw time), not zero tiles.
+pub fn tiles_for_area(cols: u16, rows: u16, version: u8) -> usize {
+    let (w, h) = cell_size_for_version(version);
+    if w == 0 || h == 0 {
+        return 1;
+    }
+    let across = (cols / w).max(1);
+    let down = (rows / h).max(1);
+    across as usize * down as usize
+}
+
 /// Smallest supported QR version, and therefore the floor on terminal size.
 pub fn smallest_version() -> u8 {
     SUPPORTED_VERSIONS[0]
@@ -156,6 +171,32 @@ pub fn decode_with_points(img: &GrayImage) -> Result<Decoded> {
         .map(|point| (point.x, point.y))
         .collect();
     Ok((result.getRawBytes().to_vec(), points))
+}
+
+/// Finds every QR code in `img`. Used after the link is up, when the sender
+/// may be tiling several DATA frames into one screen.
+pub fn decode_all(img: &GrayImage) -> Vec<Decoded> {
+    let mut hints = rxing::DecodeHints::default();
+    hints.PossibleFormats = Some(HashSet::from([rxing::BarcodeFormat::QR_CODE]));
+    let Ok(results) = rxing::helpers::detect_multiple_in_luma_with_hints(
+        img.as_raw().clone(),
+        img.width(),
+        img.height(),
+        &mut hints,
+    ) else {
+        return Vec::new();
+    };
+    results
+        .into_iter()
+        .map(|result| {
+            let points = result
+                .getPoints()
+                .iter()
+                .map(|point| (point.x, point.y))
+                .collect();
+            (result.getRawBytes().to_vec(), points)
+        })
+        .collect()
 }
 
 /// Decodes a QR code image, preserving its binary payload.
@@ -331,5 +372,37 @@ mod tests {
             max_width < 100,
             "QR render must fit a normal terminal, got {max_width} columns"
         );
+    }
+
+    #[test]
+    fn two_v10_codes_fit_side_by_side_on_a_wide_pane() {
+        let (w, h) = cell_size_for_version(10);
+        assert_eq!(tiles_for_area(w, h, 10), 1);
+        assert_eq!(tiles_for_area(w * 2, h, 10), 2);
+        assert_eq!(tiles_for_area(w * 2, h * 2, 10), 4);
+        assert_eq!(tiles_for_area(w - 1, h, 10), 1);
+    }
+
+    fn blit(dst: &mut GrayImage, src: &GrayImage, x0: u32, y0: u32) {
+        for y in 0..src.height() {
+            for x in 0..src.width() {
+                dst.put_pixel(x0 + x, y0 + y, *src.get_pixel(x, y));
+            }
+        }
+    }
+
+    #[test]
+    fn decode_all_finds_two_codes_on_one_canvas() {
+        let left = frame::encode(&frame::Payload::Ok).unwrap();
+        let right = frame::encode(&frame::Payload::Fin { sha256: [9; 32] }).unwrap();
+        let a = encode_version(&left, 10).unwrap();
+        let b = encode_version(&right, 10).unwrap();
+        let gap = 48;
+        let mut canvas = GrayImage::from_pixel(a.width() + gap + b.width(), a.height(), Luma([255]));
+        blit(&mut canvas, &a, 0, 0);
+        blit(&mut canvas, &b, a.width() + gap, 0);
+        let found: HashSet<Vec<u8>> = decode_all(&canvas).into_iter().map(|(bytes, _)| bytes).collect();
+        assert!(found.contains(&left), "missing left code, got {found:?}");
+        assert!(found.contains(&right), "missing right code, got {found:?}");
     }
 }

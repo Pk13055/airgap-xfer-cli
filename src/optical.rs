@@ -59,6 +59,21 @@ pub trait Optical {
     fn wait_locked(&mut self, prompt: &str) -> Result<bool> {
         self.gate(prompt)
     }
+
+    /// How many DATA frames this side can paint in one dwell. Handshake
+    /// frames are always a single code. Default 1.
+    fn tile_count(&self) -> usize {
+        1
+    }
+
+    /// Paint `payloads` together for one dwell. Default shows them in
+    /// sequence; the TUI draws a grid and waits once.
+    fn show_many(&mut self, payloads: &[Payload]) -> Result<()> {
+        for payload in payloads {
+            self.show(payload)?;
+        }
+        Ok(())
+    }
 }
 
 pub struct PairEnd {

@@ -17,11 +17,11 @@ use crate::{
 /// undecodable. The TUI sheds its borders, footer, and transcript to fit, so
 /// the hard floor is the code itself plus a title and a prompt line.
 const SIZE_NOTE: &str = "Both terminals need at least 65x35 cells: the smallest usable QR code is \
-65x33 on its own, and a clipped code cannot be read by the other camera. The \
-layout drops its borders and transcript on short terminals to make room. \
-Aim both cameras until tracking locks. The receiver starts on its own once \
-locked. On the sender, press Enter after lock, then one more Enter to send \
-the file. Esc aborts, q quits.";
+65x33 on its own, and a clipped code cannot be read by the other camera. After \
+the link is up the camera preview is hidden and the sender fills the screen \
+with as many codes as fit. Aim both cameras until tracking locks. The \
+receiver starts on its own once locked. On the sender, press Enter after \
+lock, then one more Enter to send the file. Esc aborts, q quits.";
 
 #[derive(Parser, Debug)]
 #[command(name = "airgap-xfer", version, after_help = SIZE_NOTE)]

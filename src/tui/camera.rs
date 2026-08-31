@@ -69,6 +69,8 @@ struct Shared {
     failure: Mutex<Option<String>>,
     /// Whether the peer's screen is currently being tracked in the frame.
     locked: AtomicBool,
+    /// After the link, decode every QR in the frame: the peer may be tiling.
+    multi: AtomicBool,
     stop: AtomicBool,
 }
 
@@ -152,6 +154,12 @@ impl CameraFeed {
         self.shared.locked.load(Ordering::Relaxed)
     }
 
+    /// Switch between single-code tracking (aiming / handshake) and
+    /// decoding every QR in the frame (DATA tiles).
+    pub fn set_multi(&self, multi: bool) {
+        self.shared.multi.store(multi, Ordering::Relaxed);
+    }
+
     /// Typical milliseconds between successful decodes, or `None` before
     /// enough have landed to say.
     pub fn decode_gap_ms(&self) -> Option<u64> {
@@ -192,27 +200,32 @@ fn capture_loop(index: u32, shared: &Shared) -> Result<()> {
             *slot = Some(Arc::new(downscale(&gray)));
         }
 
-        let decoded = tracker.decode(&gray);
+        let decoded = if shared.multi.load(Ordering::Relaxed) {
+            tracker.decode_all(&gray)
+        } else {
+            tracker.decode(&gray).into_iter().collect()
+        };
         shared.locked.store(tracker.locked(), Ordering::Relaxed);
-        let Some(bytes) = decoded else {
+        if decoded.is_empty() {
             continue;
-        };
-        let Ok(payload) = crate::frame::decode(&bytes) else {
-            continue;
-        };
-        shared.decodes.fetch_add(1, Ordering::Relaxed);
-        let now = std::time::Instant::now();
-        if let Some(previous) = last_decode.replace(now) {
-            let gap = now.duration_since(previous).as_millis() as u64;
-            let smoothed = match shared.decode_gap_ms.load(Ordering::Relaxed) {
-                0 => gap,
-                // Weighted toward history so one slow frame does not swing it.
-                current => (current * 3 + gap) / 4,
-            };
-            shared.decode_gap_ms.store(smoothed.max(1), Ordering::Relaxed);
         }
-        if let Ok(mut slot) = shared.decoded.lock() {
-            push_unique(&mut slot, payload);
+        for bytes in decoded {
+            let Ok(payload) = crate::frame::decode(&bytes) else {
+                continue;
+            };
+            shared.decodes.fetch_add(1, Ordering::Relaxed);
+            let now = std::time::Instant::now();
+            if let Some(previous) = last_decode.replace(now) {
+                let gap = now.duration_since(previous).as_millis() as u64;
+                let smoothed = match shared.decode_gap_ms.load(Ordering::Relaxed) {
+                    0 => gap,
+                    current => (current * 3 + gap) / 4,
+                };
+                shared.decode_gap_ms.store(smoothed.max(1), Ordering::Relaxed);
+            }
+            if let Ok(mut slot) = shared.decoded.lock() {
+                push_unique(&mut slot, payload);
+            }
         }
     }
     Ok(())

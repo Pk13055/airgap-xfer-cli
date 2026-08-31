@@ -42,9 +42,12 @@ pub enum UiEvent {
     /// screen. The protocol sleeps for the negotiated dwell after `show`
     /// returns, so that sleep must not start before the peer could see it.
     Show {
-        image: Arc<GrayImage>,
+        images: Vec<Arc<GrayImage>>,
         invert: bool,
         label: String,
+        /// After the link: drop the camera preview and transcript so the
+        /// codes can use the full pane.
+        compact: bool,
         drawn: Sender<()>,
     },
     Status(String),
@@ -72,6 +75,8 @@ pub struct TuiOptical {
     events: Sender<UiEvent>,
     version: u8,
     invert: bool,
+    /// Set once the link is up: hide the preview and tile DATA frames.
+    compact: bool,
 }
 
 impl TuiOptical {
@@ -81,6 +86,7 @@ impl TuiOptical {
             events,
             version: 10,
             invert,
+            compact: false,
         }
     }
 
@@ -119,17 +125,19 @@ impl TuiOptical {
         let bytes = crate::frame::encode(payload)?;
         let version = encode_version_for(payload, self.version);
         let image = Arc::new(qr::encode_version(&bytes, version)?);
+        self.paint_images(vec![image], payload_label(payload))
+    }
 
+    fn paint_images(&mut self, images: Vec<Arc<GrayImage>>, label: String) -> Result<()> {
+        check_interrupted()?;
         let (drawn, drawn_rx) = std::sync::mpsc::channel();
         self.send(UiEvent::Show {
-            image,
+            images,
             invert: self.invert,
-            label: payload_label(payload),
+            label,
+            compact: self.compact,
             drawn,
         })?;
-        // Block until the UI confirms the paint, polling the interrupt flag
-        // so Ctrl-C during a long dwell still unwinds. If the UI is gone the
-        // transfer is over anyway.
         loop {
             check_interrupted()?;
             match drawn_rx.recv_timeout(POLL_TICK) {
@@ -192,6 +200,8 @@ impl Optical for TuiOptical {
 
     fn set_version(&mut self, version: u8) {
         self.version = version;
+        self.compact = true;
+        self.camera.set_multi(true);
     }
 
     fn log(&mut self, line: &str) {
@@ -216,6 +226,47 @@ impl Optical for TuiOptical {
 
     fn wait_locked(&mut self, prompt: &str) -> Result<bool> {
         self.gate_inner(prompt, true, true)
+    }
+
+    fn tile_count(&self) -> usize {
+        if !self.compact {
+            return 1;
+        }
+        let Ok((cols, rows)) = crossterm::terminal::size() else {
+            return 1;
+        };
+        qr::tiles_for_area(cols, rows.saturating_sub(2), self.version).max(1)
+    }
+
+    fn show_many(&mut self, payloads: &[Payload]) -> Result<()> {
+        if payloads.len() <= 1 {
+            return payloads
+                .first()
+                .map(|payload| self.show(payload))
+                .unwrap_or(Ok(()));
+        }
+        let mut images = Vec::with_capacity(payloads.len());
+        let mut labels = Vec::new();
+        for payload in payloads {
+            let bytes = crate::frame::encode(payload)?;
+            let version = encode_version_for(payload, self.version);
+            images.push(Arc::new(qr::encode_version(&bytes, version)?));
+            labels.push(payload_label(payload));
+        }
+        let label = match labels.as_slice() {
+            [one] => one.clone(),
+            [first, .., last] => format!("{first}–{last}"),
+            [] => String::new(),
+        };
+        match self.paint_images(images, label) {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                let _ = self.paint(&Payload::Fail {
+                    reason: crate::frame::FAIL_PROTOCOL,
+                });
+                Err(err)
+            }
+        }
     }
 
     fn poll(&mut self, timeout: Duration) -> Result<Option<Payload>> {

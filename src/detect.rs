@@ -294,6 +294,20 @@ impl Tracker {
         self.quad = order_quad(&points);
         Some(bytes)
     }
+
+    /// Finds every QR in `frame`. After the link, the peer may tile several
+    /// codes; a single-quad crop would only ever see one of them.
+    pub fn decode_all(&mut self, frame: &GrayImage) -> Vec<Vec<u8>> {
+        let found = qr::decode_all(frame);
+        if !found.is_empty() {
+            if let Some((_, points)) = found.first() {
+                self.quad = order_quad(points).or(self.quad);
+            }
+            self.misses = 0;
+            return found.into_iter().map(|(bytes, _)| bytes).collect();
+        }
+        self.decode(frame).into_iter().collect()
+    }
 }
 
 fn rectified_size(quad: &Quad) -> u32 {
