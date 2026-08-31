@@ -50,7 +50,7 @@ use crate::{
 /// footer hints, the prompt's own border, the transcript — is dropped in that
 /// order as the terminal gets shorter, because the QR code is the one element
 /// that cannot shrink without becoming undecodable.
-const FLOOR_CHROME_ROWS: u16 = 2;
+pub(crate) const FLOOR_CHROME_ROWS: u16 = 2;
 /// Rows the transcript takes when there is room to spare.
 const LOG_ROWS: u16 = 6;
 /// Rows (and columns) a bordered block consumes.
@@ -76,6 +76,98 @@ pub fn max_qr_version(cols: u16, rows: u16) -> Result<u8> {
             have_rows: rows,
         }
     })
+}
+
+/// Title + prompt kept during a transfer. `tile_count` and the compact layout
+/// must agree on this or the grid is computed larger than the pane.
+pub(crate) fn transfer_pane_rows(rows: u16) -> u16 {
+    rows.saturating_sub(FLOOR_CHROME_ROWS)
+}
+
+/// Waits until the terminal can draw the smallest usable QR, telling the
+/// operator to zoom out or stretch the window. Returns the largest version
+/// that now fits.
+fn wait_for_terminal_size<B: ratatui::backend::Backend>(
+    terminal: &mut Terminal<B>,
+) -> Result<u8> {
+    loop {
+        live::check_interrupted()?;
+        let (cols, rows) = crossterm::terminal::size()?;
+        match max_qr_version(cols, rows) {
+            Ok(version) => return Ok(version),
+            Err(Error::TerminalTooSmall {
+                need_cols,
+                need_rows,
+                have_cols,
+                have_rows,
+            }) => {
+                terminal.draw(|frame| {
+                    draw_resize_prompt(frame, have_cols, have_rows, need_cols, need_rows);
+                })?;
+            }
+            Err(err) => return Err(err),
+        }
+
+        if !event::poll(Duration::from_millis(80))? {
+            continue;
+        }
+        match event::read()? {
+            Event::Key(key) if key.kind == KeyEventKind::Press => {
+                let quit = matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
+                    || (key.modifiers.contains(KeyModifiers::CONTROL)
+                        && matches!(key.code, KeyCode::Char('c')));
+                if quit {
+                    live::interrupt();
+                    return Err(Error::Aborted);
+                }
+            }
+            Event::Resize(_, _) => {}
+            _ => {}
+        }
+    }
+}
+
+fn draw_resize_prompt(
+    frame: &mut ratatui::Frame,
+    have_cols: u16,
+    have_rows: u16,
+    need_cols: u16,
+    need_rows: u16,
+) {
+    let col_note = if have_cols >= need_cols {
+        "ok"
+    } else {
+        "too narrow"
+    };
+    let row_note = if have_rows >= need_rows {
+        "ok"
+    } else {
+        "too short"
+    };
+    let zoom = if cfg!(target_os = "macos") {
+        "Cmd/-  or  Ctrl/-    zoom out (more cells)\n    Cmd/+  or  Ctrl/+    zoom in  (fewer cells)"
+    } else {
+        "Ctrl/-    zoom out (more cells)\n    Ctrl/+    zoom in  (fewer cells)"
+    };
+    let body = format!(
+        "This terminal cannot yet draw a readable QR code.\n\n\
+         \u{00a0} now     {have_cols} × {have_rows}    columns {col_note}, rows {row_note}\n\
+         \u{00a0} need    {need_cols} × {need_rows}    (or larger)\n\n\
+         Stretch the window, or change the font size:\n    {zoom}\n\n\
+         The numbers update as you resize. Esc or q aborts."
+    );
+    let area = frame.area();
+    frame.render_widget(
+        Paragraph::new(body)
+            .style(Style::new().fg(Color::Yellow))
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" enlarge the terminal "),
+            ),
+        area,
+    );
 }
 
 /// How much of the frame this terminal can afford around a `qr_rows` x
@@ -189,12 +281,18 @@ where
 {
     live::install_ctrlc_handler();
 
-    let (cols, rows) = crossterm::terminal::size()?;
-    let max_version = max_qr_version(cols, rows)?;
-
     // Open the camera before taking over the screen so a permission prompt or
     // device error is readable in the normal terminal.
     let feed = Arc::new(CameraFeed::open(camera_index)?);
+
+    let mut terminal = enter()?;
+    let max_version = match wait_for_terminal_size(&mut terminal) {
+        Ok(version) => version,
+        Err(err) => {
+            leave(&mut terminal);
+            return Err(err);
+        }
+    };
 
     let (events_tx, events_rx) = mpsc::channel::<UiEvent>();
     let worker_feed = Arc::clone(&feed);
@@ -224,7 +322,6 @@ where
         result
     });
 
-    let mut terminal = enter()?;
     let ui_result = event_loop(
         &mut terminal,
         &feed,
@@ -449,7 +546,12 @@ fn draw(
     status: FeedStatus,
 ) {
     let area = frame.area();
-    let (qr_cols, qr_rows) = qr::cell_size_for_version(ui.max_version);
+    let (qr_cols, qr_rows) = if let Some(img) = ui.images.first() {
+        let modules = qr::modules_of(img) as u16;
+        (modules, modules.div_ceil(2))
+    } else {
+        qr::cell_size_for_version(ui.max_version)
+    };
     let chrome = if ui.compact {
         Chrome {
             qr_border: 0,

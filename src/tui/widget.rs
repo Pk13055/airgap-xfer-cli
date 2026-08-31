@@ -111,14 +111,13 @@ impl Widget for QrGridWidget<'_> {
         if tile_w == 0 || tile_h == 0 {
             return;
         }
-        let n = self.images.len() as u16;
-        let across = (area.width / tile_w).max(1).min(n);
-        let down = n.div_ceil(across);
-        let grid_w = across.saturating_mul(tile_w);
-        let grid_h = down.saturating_mul(tile_h);
-        if grid_w > area.width || grid_h > area.height {
+        let n = self.images.len();
+        let across_fit = (area.width / tile_w).max(1);
+        let down_fit = (area.height / tile_h).max(1);
+        let cap = (across_fit as usize).saturating_mul(down_fit as usize);
+        if tile_w > area.width || tile_h > area.height || cap == 0 {
             Paragraph::new(format!(
-                "QR grid needs {grid_w}x{grid_h} cells, pane is {}x{}.\nEnlarge the terminal.",
+                "QR needs {tile_w}x{tile_h} cells, pane is {}x{}. Zoom out (Ctrl/- or Cmd/-) or enlarge the window.",
                 area.width, area.height
             ))
             .style(quiet)
@@ -127,10 +126,18 @@ impl Widget for QrGridWidget<'_> {
             .render(area, buf);
             return;
         }
+        // Never blank the pane: if we asked for more tiles than fit, draw
+        // the ones that do. tile_count is supposed to match, but ratatui's
+        // area can be a cell or two smaller than crossterm's size.
+        let shown = n.min(cap);
+        let across = across_fit.min(shown as u16).max(1);
+        let down = (shown as u16).div_ceil(across);
+        let grid_w = across.saturating_mul(tile_w);
+        let grid_h = down.saturating_mul(tile_h);
 
         let origin_x = area.x + (area.width - grid_w) / 2;
         let origin_y = area.y + (area.height - grid_h) / 2;
-        for (i, image) in self.images.iter().enumerate() {
+        for (i, image) in self.images.iter().take(shown).enumerate() {
             let col = i as u16 % across;
             let row = i as u16 / across;
             let cell = Rect {
@@ -253,5 +260,29 @@ mod tests {
             !text.contains('█') && !text.contains('▀'),
             "must not draw a partial code, got {text:?}"
         );
+    }
+
+    #[test]
+    fn qr_grid_still_draws_one_code_when_the_pane_cannot_hold_the_whole_grid() {
+        let a = qr::encode_version(b"AX-a", 10).unwrap();
+        let b = qr::encode_version(b"AX-b", 10).unwrap();
+        let (cols, rows) = qr::cell_size_for_version(10);
+        let images = [
+            std::sync::Arc::new(a),
+            std::sync::Arc::new(b),
+        ];
+        // Tall enough for one tile, not two stacked.
+        let area = Rect::new(0, 0, cols, rows);
+        let mut buf = Buffer::empty(area);
+        QrGridWidget {
+            images: &images,
+            invert: false,
+        }
+        .render(area, &mut buf);
+        let dark = (0..area.height)
+            .flat_map(|y| (0..area.width).map(move |x| (x, y)))
+            .filter(|&(x, y)| buf[(x, y)].symbol() != " ")
+            .count();
+        assert!(dark > 0, "expected at least one code to be drawn");
     }
 }

@@ -235,7 +235,8 @@ impl Optical for TuiOptical {
         let Ok((cols, rows)) = crossterm::terminal::size() else {
             return 1;
         };
-        qr::tiles_for_area(cols, rows.saturating_sub(2), self.version).max(1)
+        let pane_rows = super::transfer_pane_rows(rows).saturating_sub(1);
+        qr::tiles_for_area(cols, pane_rows, self.version).max(1)
     }
 
     fn show_many(&mut self, payloads: &[Payload]) -> Result<()> {
