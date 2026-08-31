@@ -52,11 +52,13 @@ pub enum UiEvent {
     /// Hold here until the operator answers on `reply`.
     ///
     /// When `require_lock` is set, Enter is ignored until the camera is
-    /// tracking the peer's screen — that is the only turn-based step.
+    /// tracking the peer's screen. When `auto_on_lock` is also set, lock
+    /// itself is the answer — used by the receiver so there is no extra Enter.
     Gate {
         prompt: String,
         reply: Sender<GateReply>,
         require_lock: bool,
+        auto_on_lock: bool,
     },
     /// The protocol finished; `summary` is the line to leave on screen.
     Finished { summary: String },
@@ -88,13 +90,14 @@ impl TuiOptical {
             .map_err(|_| display_closed())
     }
 
-    fn gate_inner(&mut self, prompt: &str, require_lock: bool) -> Result<bool> {
+    fn gate_inner(&mut self, prompt: &str, require_lock: bool, auto_on_lock: bool) -> Result<bool> {
         check_interrupted()?;
         let (reply, reply_rx) = std::sync::mpsc::channel();
         self.send(UiEvent::Gate {
             prompt: prompt.to_string(),
             reply,
             require_lock,
+            auto_on_lock,
         })?;
 
         loop {
@@ -204,11 +207,15 @@ impl Optical for TuiOptical {
     }
 
     fn gate(&mut self, prompt: &str) -> Result<bool> {
-        self.gate_inner(prompt, false)
+        self.gate_inner(prompt, false, false)
     }
 
     fn gate_locked(&mut self, prompt: &str) -> Result<bool> {
-        self.gate_inner(prompt, true)
+        self.gate_inner(prompt, true, false)
+    }
+
+    fn wait_locked(&mut self, prompt: &str) -> Result<bool> {
+        self.gate_inner(prompt, true, true)
     }
 
     fn poll(&mut self, timeout: Duration) -> Result<Option<Payload>> {

@@ -40,6 +40,10 @@ pub struct LinkConfig {
     /// table. Raised on retries: the receiver's camera needs several frames per
     /// displayed code to have a fair chance at every one of them.
     pub dwell_floor_ms: u16,
+    /// Sender only: pause for Enter after LINK and before GO, so the offer
+    /// and the first DATA follow the keypress immediately. The receiver is
+    /// still waiting for GO at that point and has not started stall detection.
+    pub confirm_offer: bool,
 }
 
 /// Timeout used for peer replies when a human sits between the phases.
@@ -52,6 +56,7 @@ impl Default for LinkConfig {
             patient: false,
             max_qr_version: 40,
             dwell_floor_ms: 0,
+            confirm_offer: false,
         }
     }
 }
@@ -66,12 +71,13 @@ impl LinkConfig {
     }
 
     /// The first, interactive attempt: generous timeouts so a human can aim,
-    /// and QR versions capped to what this terminal can draw. Handshake phases
-    /// themselves do not wait for Enter.
+    /// QR versions capped to what this terminal can draw, and one Enter on
+    /// the sender before GO. Handshake probes themselves do not wait for Enter.
     pub fn gated(max_qr_version: u8) -> Self {
         Self {
             patient: true,
             max_qr_version,
+            confirm_offer: true,
             ..Self::default()
         }
     }
@@ -299,6 +305,16 @@ pub fn run_send_handshake(
         return Err(Error::Message(format!(
             "filename {basename:?} makes the offer {go_len} bytes; QR v{qr_version} holds {cap}"
         )));
+    }
+    // Confirm here, not after the receiver has already accepted: that left
+    // the receiver in the DATA loop (and stall detection) while this side
+    // still waited for Enter.
+    if cfg.confirm_offer
+        && !opt.gate(&format!(
+            "Ready to send {basename} in {chunk_count} chunks. Enter to start the transfer"
+        ))?
+    {
+        return Err(Error::Aborted);
     }
     opt.show(&go)?;
 
@@ -765,6 +781,7 @@ mod tests {
     #[test]
     fn gated_configs_wait_minutes_so_a_human_can_read_the_screen() {
         let cfg = LinkConfig::gated(15);
+        assert!(cfg.confirm_offer);
         assert_eq!(hello_timeout(cfg), GATED_TIMEOUT);
         assert_eq!(link_timeout(cfg), GATED_TIMEOUT);
         assert_eq!(go_timeout(cfg), GATED_TIMEOUT);
@@ -992,5 +1009,107 @@ mod tests {
         run_recv_handshake(&mut opt, &out, false, LinkConfig::fast()).unwrap();
 
         assert_eq!(opt.poll_count, 2);
+    }
+
+    struct OfferGate<T> {
+        inner: T,
+        prompts: Vec<String>,
+        allow: bool,
+        shown: Vec<Payload>,
+    }
+
+    impl<T: Optical> Optical for OfferGate<T> {
+        fn show(&mut self, payload: &Payload) -> Result<()> {
+            self.shown.push(payload.clone());
+            self.inner.show(payload)
+        }
+
+        fn poll(&mut self, timeout: Duration) -> Result<Option<Payload>> {
+            self.inner.poll(timeout)
+        }
+
+        fn set_version(&mut self, version: u8) {
+            self.inner.set_version(version);
+        }
+
+        fn log(&mut self, _line: &str) {}
+
+        fn gate(&mut self, prompt: &str) -> Result<bool> {
+            self.prompts.push(prompt.to_string());
+            Ok(self.allow)
+        }
+    }
+
+    #[test]
+    fn the_sender_confirms_once_before_go_not_before_each_probe() {
+        let (send_end, recv_end) = pair();
+        let mut send_opt = OfferGate {
+            inner: send_end,
+            prompts: Vec::new(),
+            allow: true,
+            shown: Vec::new(),
+        };
+        let mut recv_opt = recv_end;
+        let cfg = LinkConfig {
+            fast: true,
+            confirm_offer: true,
+            ..LinkConfig::default()
+        };
+
+        let send_t = thread::spawn(move || {
+            run_send_handshake(&mut send_opt, "dir".into(), 10, &[1u8, 2, 3], [7; 32], cfg)
+                .map(|session| (session, send_opt.prompts, send_opt.shown))
+        });
+        run_recv_handshake(&mut recv_opt, &scratch_dir("confirm-go"), false, cfg).unwrap();
+        let (_, prompts, shown) = send_t.join().unwrap().unwrap();
+
+        assert_eq!(prompts.len(), 1, "{prompts:?}");
+        assert!(prompts[0].contains("Enter to start the transfer"), "{prompts:?}");
+        let go_at = shown
+            .iter()
+            .position(|payload| matches!(payload, Payload::Go { .. }))
+            .expect("GO must be shown after the operator confirms");
+        assert!(
+            shown.iter().take(go_at).all(|payload| matches!(payload, Payload::Probe { .. })),
+            "only probes should precede GO, got {shown:?}"
+        );
+    }
+
+    #[test]
+    fn declining_the_offer_sends_no_go_at_all() {
+        let (send_end, mut recv_end) = pair();
+        let mut send_opt = OfferGate {
+            inner: send_end,
+            prompts: Vec::new(),
+            allow: false,
+            shown: Vec::new(),
+        };
+        let cfg = LinkConfig {
+            fast: true,
+            confirm_offer: true,
+            ..LinkConfig::default()
+        };
+        let recv_t = thread::spawn(move || {
+            run_recv_handshake(&mut recv_end, &scratch_dir("decline-go"), false, cfg)
+        });
+        let err = run_send_handshake(
+            &mut send_opt,
+            "dir".into(),
+            10,
+            &[1u8, 2, 3],
+            [7; 32],
+            cfg,
+        )
+        .unwrap_err();
+        let _ = recv_t.join();
+        assert!(matches!(err, Error::Aborted), "{err:?}");
+        assert!(
+            send_opt
+                .shown
+                .iter()
+                .all(|payload| matches!(payload, Payload::Probe { .. })),
+            "a declined offer must not show GO, got {:?}",
+            send_opt.shown
+        );
     }
 }

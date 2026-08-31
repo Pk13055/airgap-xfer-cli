@@ -6,10 +6,10 @@
 //! exactly one cell per module on a forced white ground, a camera preview to
 //! aim with, and a transcript of the phases.
 //!
-//! The transfer is not turn-based after aiming. Enter is required to confirm
-//! that the camera is tracking the other terminal, and once more on the sender
-//! to start the file. Handshake probes, ACKs, and the receive side then run
-//! unattended.
+//! The transfer is not turn-based after aiming. The receiver starts as soon
+//! as tracking locks. The sender presses Enter after lock to begin the
+//! handshake, then once more to send the file. Handshake probes, ACKs, and
+//! the receive side then run unattended.
 
 pub mod camera;
 pub mod optical;
@@ -134,6 +134,22 @@ impl Chrome {
     }
 }
 
+/// How aiming ends before the protocol thread starts the handshake.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Aim {
+    /// Sender: tracking must lock, then Enter starts the handshake.
+    EnterWhenLocked,
+    /// Receiver: handshake starts as soon as tracking locks. No Enter.
+    AutoWhenLocked,
+}
+
+struct Gate {
+    prompt: String,
+    reply: mpsc::Sender<GateReply>,
+    require_lock: bool,
+    auto_on_lock: bool,
+}
+
 struct Ui {
     title: String,
     camera_index: u32,
@@ -146,7 +162,7 @@ struct Ui {
     label: String,
     status: String,
     log: Vec<String>,
-    gate: Option<(String, mpsc::Sender<GateReply>, bool)>,
+    gate: Option<Gate>,
     done: Option<String>,
 }
 
@@ -164,7 +180,7 @@ impl Ui {
 /// `work` receives an [`Optical`](crate::optical::Optical) bound to this
 /// display and the largest QR version the terminal can draw, and returns the
 /// line to leave on screen when it finishes.
-pub fn run<F>(title: &str, camera_index: u32, no_invert: bool, work: F) -> Result<()>
+pub fn run<F>(title: &str, camera_index: u32, no_invert: bool, aim: Aim, work: F) -> Result<()>
 where
     F: FnOnce(TuiOptical, u8) -> Result<String> + Send + 'static,
 {
@@ -183,9 +199,14 @@ where
         let mut optical = TuiOptical::new(worker_feed, events_tx.clone(), no_invert);
         let confirmed = {
             use crate::optical::Optical;
-            optical.gate_locked(&format!(
-                "Aim camera {camera_index} at the other terminal until tracking locks, then press Enter"
-            ))
+            match aim {
+                Aim::EnterWhenLocked => optical.gate_locked(&format!(
+                    "Aim camera {camera_index} at the other terminal until tracking locks, then press Enter"
+                )),
+                Aim::AutoWhenLocked => optical.wait_locked(&format!(
+                    "Aim camera {camera_index} at the other terminal until tracking locks — receive starts on its own"
+                )),
+            }
         };
         let result = match confirmed {
             Ok(true) => work(optical, max_version),
@@ -303,19 +324,20 @@ fn event_loop<B: ratatui::backend::Backend>(
                 match key.code {
                     KeyCode::Enter => {
                         let allow = match &ui.gate {
-                            Some((_, _, true)) => feed.locked(),
-                            Some((_, _, false)) => true,
+                            Some(gate) if gate.auto_on_lock => false,
+                            Some(gate) if gate.require_lock => feed.locked(),
+                            Some(_) => true,
                             None => false,
                         };
                         if allow {
-                            if let Some((_, reply, _)) = ui.gate.take() {
-                                let _ = reply.send(GateReply::Proceed);
+                            if let Some(gate) = ui.gate.take() {
+                                let _ = gate.reply.send(GateReply::Proceed);
                             }
                         }
                     }
                     KeyCode::Esc => {
-                        if let Some((_, reply, _)) = ui.gate.take() {
-                            let _ = reply.send(GateReply::Abort);
+                        if let Some(gate) = ui.gate.take() {
+                            let _ = gate.reply.send(GateReply::Abort);
                         }
                     }
                     _ => {}
@@ -355,8 +377,14 @@ fn event_loop<B: ratatui::backend::Backend>(
                     prompt,
                     reply,
                     require_lock,
+                    auto_on_lock,
                 }) => {
-                    ui.gate = Some((prompt, reply, require_lock));
+                    ui.gate = Some(Gate {
+                        prompt,
+                        reply,
+                        require_lock,
+                        auto_on_lock,
+                    });
                     dirty = true;
                 }
                 Ok(UiEvent::Finished { summary }) => {
@@ -383,6 +411,14 @@ fn event_loop<B: ratatui::backend::Backend>(
             };
             terminal.draw(|frame| draw(frame, &ui, preview.as_deref(), status))?;
             last_draw = Instant::now();
+        }
+        if ui.done.is_none()
+            && matches!(&ui.gate, Some(gate) if gate.auto_on_lock)
+            && feed.locked()
+        {
+            if let Some(gate) = ui.gate.take() {
+                let _ = gate.reply.send(GateReply::Proceed);
+            }
         }
         if let Some(ack) = pending_draw_ack {
             let _ = ack.send(());
@@ -516,25 +552,31 @@ fn draw(
 
     let hints = match (&ui.done, &ui.gate) {
         (Some(_), _) => "any key: exit",
-        (None, Some((_, _, true))) if !status.locked => {
+        (None, Some(gate)) if gate.require_lock && !status.locked => {
             "keep aiming until ● tracking   Esc: abort   q: quit"
         }
+        (None, Some(gate)) if gate.auto_on_lock => "Esc: abort   q: quit",
         (None, Some(_)) => "Enter: continue   Esc: abort   q: quit",
         (None, None) => "q: quit",
     };
     let (prompt_style, mut prompt) = match (&ui.done, &ui.gate) {
         (Some(summary), _) => (Style::new().fg(Color::Cyan), summary.clone()),
-        (None, Some((_, _, true))) if !status.locked => (
+        (None, Some(gate)) if gate.require_lock && !status.locked => (
             Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-            "▶ Aim at the other terminal until tracking locks, then press Enter".into(),
+            if gate.auto_on_lock {
+                "▶ Aim at the other terminal until tracking locks — receive starts on its own"
+                    .into()
+            } else {
+                "▶ Aim at the other terminal until tracking locks, then press Enter".into()
+            },
         ),
-        (None, Some((text, _, true))) if status.locked => (
+        (None, Some(gate)) if gate.require_lock && status.locked => (
             Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
-            format!("▶ Tracking locked. {text}"),
+            format!("▶ Tracking locked. {}", gate.prompt),
         ),
-        (None, Some((text, _, _))) => (
+        (None, Some(gate)) => (
             Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-            format!("▶ {text}"),
+            format!("▶ {}", gate.prompt),
         ),
         (None, None) => (
             Style::new().fg(Color::DarkGray),

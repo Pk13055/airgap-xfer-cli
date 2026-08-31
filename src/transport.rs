@@ -19,27 +19,12 @@ const STALL_LIMIT: u32 = 20;
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TransportConfig {
     pub fast: bool,
-    /// Pauses for an operator confirmation before the first DATA frame. The
-    /// chunk loop itself is never gated: a human cannot arbitrate thousands of
-    /// frames, and the ACK protocol already paces the window.
-    pub gated: bool,
 }
 
 impl TransportConfig {
     /// Millisecond timeouts, for in-process tests.
     pub fn fast() -> Self {
-        Self {
-            fast: true,
-            gated: false,
-        }
-    }
-
-    /// Interactive settings: one confirmation before the transfer starts.
-    pub fn gated() -> Self {
-        Self {
-            fast: false,
-            gated: true,
-        }
+        Self { fast: true }
     }
 }
 
@@ -68,13 +53,15 @@ fn burst_quiet(cfg: TransportConfig, dwell_ms: u16) -> Duration {
     }
 }
 
-/// Live transfers wait this long for the first DATA: the sender still has one
-/// Enter to press after the handshake, and that is not a stall.
-fn first_data_budget(cfg: TransportConfig) -> Duration {
+/// Live transfers never treat "no DATA yet" as a stall. The sender may still
+/// be painting GO or encoding the first chunk; a retry would start a new
+/// handshake while the peer is still on this one. Fast tests keep a bound so
+/// a silent peer cannot hang the suite.
+fn first_data_budget(cfg: TransportConfig) -> Option<Duration> {
     if cfg.fast {
-        ack_timeout(cfg) * STALL_LIMIT
+        Some(ack_timeout(cfg) * STALL_LIMIT)
     } else {
-        Duration::from_secs(600)
+        None
     }
 }
 
@@ -105,6 +92,15 @@ fn missing_seqs(base: u32, end: u32, bitmap: u32) -> Vec<u32> {
     (base..end)
         .filter(|seq| bitmap & (1 << (seq - base)) == 0)
         .collect()
+}
+
+/// HELLO / PROBE / LINK mean the peer gave up on this attempt and started
+/// another handshake. That is not a missing DATA sequence.
+fn is_handshake_restart(payload: &Payload) -> bool {
+    matches!(
+        payload,
+        Payload::Hello { .. } | Payload::Probe { .. } | Payload::Link { .. }
+    )
 }
 
 fn window_bitmap(got: &HashSet<u32>, base: u32, end: u32) -> u32 {
@@ -154,13 +150,6 @@ pub fn send_blob(
         return Err(Error::HandshakeFailed);
     }
 
-    if cfg.gated && !opt.gate(&format!(
-        "Ready to send {} in {chunk_count} chunks. Enter to start the transfer",
-        session.basename
-    ))? {
-        return Err(Error::Aborted);
-    }
-
     let start_time = Instant::now();
     let mut base = 0;
     while base < chunk_count {
@@ -191,6 +180,9 @@ pub fn send_blob(
                         bitmap |= ack_bitmap;
                         received_ack = true;
                         break;
+                    }
+                    Some(payload) if is_handshake_restart(&payload) => {
+                        return Err(Error::HandshakeFailed);
                     }
                     Some(_) => {}
                     None => break,
@@ -288,6 +280,7 @@ pub fn recv_blob(
     let mut seen_data = false;
     let mut last_old_window: Option<u32> = None;
     let quiet = burst_quiet(cfg, session.dwell_ms);
+    opt.set_status("waiting for sender to start the transfer");
 
     loop {
         let end = (base + WINDOW).min(chunk_count);
@@ -348,6 +341,9 @@ pub fn recv_blob(
             }
             Some(Payload::Fail { reason: FAIL_HASH }) => return Err(Error::HashMismatch),
             Some(Payload::Fail { .. }) => return Err(Error::HandshakeFailed),
+            Some(payload) if is_handshake_restart(&payload) => {
+                return Err(Error::HandshakeFailed);
+            }
             Some(Payload::Fin { .. }) if got.len() == chunk_count as usize => {
                 if blob.len() != compressed_size {
                     return Err(Error::HandshakeFailed);
@@ -370,7 +366,7 @@ pub fn recv_blob(
                     continue;
                 }
                 if !seen_data {
-                    if start_time.elapsed() >= first_data_budget(cfg) {
+                    if first_data_budget(cfg).is_some_and(|budget| start_time.elapsed() >= budget) {
                         return Err(Error::Stalled(missing_seqs(
                             base,
                             end,
@@ -427,31 +423,6 @@ mod tests {
         }
     }
 
-    struct Gated<T> {
-        inner: T,
-        prompts: Vec<String>,
-        allow: bool,
-        data_shown: usize,
-    }
-
-    impl<T: Optical> Optical for Gated<T> {
-        fn show(&mut self, payload: &Payload) -> Result<()> {
-            if matches!(payload, Payload::Data { .. }) {
-                self.data_shown += 1;
-            }
-            self.inner.show(payload)
-        }
-
-        fn poll(&mut self, timeout: Duration) -> Result<Option<Payload>> {
-            self.inner.poll(timeout)
-        }
-
-        fn gate(&mut self, prompt: &str) -> Result<bool> {
-            self.prompts.push(prompt.to_string());
-            Ok(self.allow)
-        }
-    }
-
     fn session_for(blob: &[u8], version: u8) -> Session {
         let cs = data_chunk_size(version);
         let chunk_count = ((blob.len() + cs - 1) / cs) as u32;
@@ -488,67 +459,17 @@ mod tests {
     }
 
     #[test]
-    fn the_operator_confirms_once_before_the_first_chunk_not_once_per_chunk() {
-        let blob: Vec<u8> = (0..2000u32).map(|i| i as u8).collect();
+    fn a_peer_that_restarts_the_handshake_does_not_look_like_a_stall() {
+        let blob = vec![1u8; 10];
         let sess = session_for(&blob, 10);
-        let (s, mut r) = pair();
-        let mut s = Gated {
-            inner: s,
-            prompts: Vec::new(),
-            allow: true,
-            data_shown: 0,
-        };
-        let recv_sess = sess.clone();
-        let recv = thread::spawn(move || {
-            let got = recv_blob(&mut r, &recv_sess, TransportConfig::fast()).unwrap();
-            // recv_blob leaves OK to its caller (which must durably write
-            // first); stand in for that here so send_blob unblocks.
-            r.show(&Payload::Ok).unwrap();
-            got
-        });
-        send_blob(
-            &mut s,
-            &sess,
-            &blob,
-            TransportConfig {
-                fast: true,
-                gated: true,
-            },
-        )
+        let (mut s, mut r) = pair();
+        s.show(&Payload::Hello {
+            protocol_ver: crate::frame::PROTOCOL_VERSION,
+            role: 1,
+        })
         .unwrap();
-        assert_eq!(recv.join().unwrap(), blob);
-
-        assert_eq!(s.prompts.len(), 1, "{:?}", s.prompts);
-        assert!(s.prompts[0].contains(&format!("{} chunks", sess.chunk_count)));
-        assert!(s.data_shown >= sess.chunk_count as usize);
-    }
-
-    #[test]
-    fn declining_the_start_gate_sends_no_data_at_all() {
-        let blob: Vec<u8> = (0..2000u32).map(|i| i as u8).collect();
-        let sess = session_for(&blob, 10);
-        let (s, _r) = pair();
-        let mut s = Gated {
-            inner: s,
-            prompts: Vec::new(),
-            allow: false,
-            data_shown: 0,
-        };
-        let err = send_blob(
-            &mut s,
-            &sess,
-            &blob,
-            TransportConfig {
-                fast: true,
-                gated: true,
-            },
-        )
-        .unwrap_err();
-        assert!(matches!(err, Error::Aborted), "{err:?}");
-        assert_eq!(
-            s.data_shown, 0,
-            "a declined transfer must not blast frames at a receiver that moved on"
-        );
+        let err = recv_blob(&mut r, &sess, TransportConfig::fast()).unwrap_err();
+        assert!(matches!(err, Error::HandshakeFailed), "{err:?}");
     }
 
     #[test]

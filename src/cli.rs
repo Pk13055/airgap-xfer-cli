@@ -19,9 +19,9 @@ use crate::{
 const SIZE_NOTE: &str = "Both terminals need at least 65x35 cells: the smallest usable QR code is \
 65x33 on its own, and a clipped code cannot be read by the other camera. The \
 layout drops its borders and transcript on short terminals to make room. \
-Aim both cameras until tracking locks, then press Enter. After that the \
-handshake runs on its own. One Enter on the sender starts the file; the \
-receiver takes it without further keypresses. Esc aborts, q quits.";
+Aim both cameras until tracking locks. The receiver starts on its own once \
+locked. On the sender, press Enter after lock, then one more Enter to send \
+the file. Esc aborts, q quits.";
 
 #[derive(Parser, Debug)]
 #[command(name = "airgap-xfer", version, after_help = SIZE_NOTE)]
@@ -99,7 +99,7 @@ fn send(path: PathBuf, camera: u32, keep_temp: bool, no_invert: bool) -> crate::
     let temp_path = packed.temp_path.clone();
     let warnings = std::mem::take(&mut packed.warnings);
     let title = format!("airgap-xfer · SEND {}", packed.basename);
-    let result = tui::run(&title, camera, no_invert, move |mut opt, max_version| {
+    let result = tui::run(&title, camera, no_invert, tui::Aim::EnterWhenLocked, move |mut opt, max_version| {
         let blob = fs::read(&packed.temp_path)?;
         let done = session::send_with_fallback(
             &mut opt,
@@ -147,7 +147,7 @@ fn recv(
     no_invert: bool,
 ) -> crate::Result<()> {
     let title = format!("airgap-xfer · RECV into {}", outdir.display());
-    tui::run(&title, camera, no_invert, move |mut opt, max_version| {
+    tui::run(&title, camera, no_invert, tui::Aim::AutoWhenLocked, move |mut opt, max_version| {
         let (done, blob) =
             session::recv_with_fallback(&mut opt, &outdir, force, max_version)?;
 

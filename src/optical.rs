@@ -39,8 +39,9 @@ pub trait Optical {
     /// Blocks until the operator confirms the upcoming phase described by
     /// `prompt`, returning `Ok(true)` to proceed and `Ok(false)` to abort.
     ///
-    /// Used for the sender's one "send the file" confirmation after the
-    /// link is up. Aiming uses [`Optical::gate_locked`] instead.
+    /// Used for the sender's one "send the file" confirmation after LINK,
+    /// immediately before GO. Aiming uses [`Optical::gate_locked`] or
+    /// [`Optical::wait_locked`].
     fn gate(&mut self, _prompt: &str) -> Result<bool> {
         Ok(true)
     }
@@ -49,6 +50,13 @@ pub trait Optical {
     /// tracking the peer. Default is an ordinary gate, which in-process tests
     /// auto-accept.
     fn gate_locked(&mut self, prompt: &str) -> Result<bool> {
+        self.gate(prompt)
+    }
+
+    /// Blocks until the camera is tracking the peer, then proceeds without
+    /// Enter. Receiver aiming uses this so there is no "Enter to receive"
+    /// after the sender has already started. Default auto-accepts.
+    fn wait_locked(&mut self, prompt: &str) -> Result<bool> {
         self.gate(prompt)
     }
 }

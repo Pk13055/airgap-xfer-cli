@@ -31,7 +31,9 @@ pub struct Completed {
 /// The link and transport settings for attempt `n`.
 ///
 /// The first attempt is the interactive one: it waits for the operator to
-/// confirm aiming, then (on the sender) to start the file. Handshake phases
+/// confirm aiming, then (on the sender) to start the file — that confirmation
+/// is part of the handshake, immediately before GO, so the receiver is still
+/// waiting for the offer rather than already timing DATA. Handshake probes
 /// and the receive side run unattended. Every retry is fully unattended —
 /// having committed to the transfer once, being asked to re-confirm each
 /// rung of the ladder would defeat the point of retrying automatically.
@@ -42,10 +44,7 @@ pub fn configs_for(attempt: usize, terminal_max: u8) -> (LinkConfig, TransportCo
     } else {
         LinkConfig::retry(plan)
     };
-    let transport_cfg = TransportConfig {
-        fast: false,
-        gated: attempt == 0,
-    };
+    let transport_cfg = TransportConfig { fast: false };
     (link_cfg, transport_cfg, plan)
 }
 
@@ -326,18 +325,21 @@ mod tests {
 
     #[test]
     fn only_the_first_attempt_asks_the_operator_anything() {
-        let (first_link, first_transport, _) = configs_for(0, 40);
+        let (first_link, _, _) = configs_for(0, 40);
         assert!(
             first_link.patient,
             "the first attempt still waits for a human to aim"
         );
         assert!(
-            first_transport.gated,
-            "the sender confirms once before the file goes"
+            first_link.confirm_offer,
+            "the sender confirms once before GO, while the receiver is still waiting for the offer"
         );
         for attempt in 1..MAX_ATTEMPTS {
-            let (link_cfg, transport_cfg, _) = configs_for(attempt, 40);
-            assert!(!transport_cfg.gated, "attempt {attempt} must not prompt");
+            let (link_cfg, _, _) = configs_for(attempt, 40);
+            assert!(
+                !link_cfg.confirm_offer,
+                "attempt {attempt} must not prompt"
+            );
             assert!(
                 link_cfg.patient,
                 "attempt {attempt} still needs long timeouts: the peer may be \
