@@ -20,9 +20,9 @@ const SIZE_NOTE: &str = "Both terminals need at least 65x35 cells: the smallest 
 65x33 on its own, and a clipped code cannot be read by the other camera. If \
 the window is smaller, airgap-xfer waits and asks you to zoom out (Ctrl/- or \
 Cmd/-) or stretch the window. After the link, the camera preview hides and \
-the sender fills the screen with as many codes as fit. Aim until tracking \
-locks. The receiver starts on its own. On the sender, press Enter after lock, \
-then one more Enter to send. Esc aborts, q quits.";
+the sender fills the screen with as many codes as fit. The receiver shows \
+its code at once. Aim the sender until tracking locks, press Enter, then one \
+more Enter to send. Esc aborts, q quits.";
 
 #[derive(Parser, Debug)]
 #[command(name = "airgap-xfer", version, after_help = SIZE_NOTE)]
@@ -148,7 +148,7 @@ fn recv(
     no_invert: bool,
 ) -> crate::Result<()> {
     let title = format!("airgap-xfer · RECV into {}", outdir.display());
-    tui::run(&title, camera, no_invert, tui::Aim::AutoWhenLocked, move |mut opt, max_version| {
+    tui::run(&title, camera, no_invert, tui::Aim::Immediate, move |mut opt, max_version| {
         let (done, blob) =
             session::recv_with_fallback(&mut opt, &outdir, force, max_version)?;
 

@@ -6,9 +6,9 @@
 //! exactly one cell per module on a forced white ground, a camera preview to
 //! aim with, and a transcript of the phases.
 //!
-//! The transfer is not turn-based after aiming. The receiver starts as soon
-//! as tracking locks. The sender presses Enter after lock to begin the
-//! handshake, then once more to send the file. Handshake probes, ACKs, and
+//! The transfer is not turn-based after aiming. The receiver shows HELLO
+//! straight away so the sender has a code to lock onto. The sender presses
+//! Enter after lock to begin the handshake, then once more to send the file. Handshake probes, ACKs, and
 //! the receive side then run unattended.
 
 pub mod camera;
@@ -231,8 +231,11 @@ impl Chrome {
 pub enum Aim {
     /// Sender: tracking must lock, then Enter starts the handshake.
     EnterWhenLocked,
-    /// Receiver: handshake starts as soon as tracking locks. No Enter.
-    AutoWhenLocked,
+    /// Receiver: handshake starts at once. Its HELLO is the only code on
+    /// either screen before the link, so it must not wait for a lock of its
+    /// own: the sender shows nothing until it reads HELLO, and tracking only
+    /// locks on a decoded code. The HELLO loop waits for probes on its own.
+    Immediate,
 }
 
 struct Gate {
@@ -304,9 +307,12 @@ where
                 Aim::EnterWhenLocked => optical.gate_locked(&format!(
                     "Aim camera {camera_index} at the other terminal until tracking locks, then press Enter"
                 )),
-                Aim::AutoWhenLocked => optical.wait_locked(&format!(
-                    "Aim camera {camera_index} at the other terminal until tracking locks — receive starts on its own"
-                )),
+                Aim::Immediate => {
+                    optical.set_status(&format!(
+                        "Showing HELLO. Aim camera {camera_index} at the sender; receive starts on its own"
+                    ));
+                    Ok(true)
+                }
             }
         };
         let result = match confirmed {
