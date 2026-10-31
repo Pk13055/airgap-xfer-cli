@@ -14,7 +14,7 @@ use std::{
 use sha2::{Digest, Sha256};
 
 use crate::{
-    chunks::{plan_spans, report_limit, span_bytes, ChunkSet, ChunkStore, WINDOW_CHUNKS},
+    chunks::{plan_spans, report_limit, span_bytes, ChunkSet, ChunkStore},
     frame::{chunks_per_frame, fail_error, progress_windows, Payload, FAIL_HASH, FAIL_PROTOCOL},
     link::Session,
     optical::Optical,
@@ -165,7 +165,8 @@ fn show_spans(
 }
 
 /// Waits up to `timeout` for a progress report not seen before and folds it
-/// into `acked`.
+/// into `acked`, then folds in every report already queued behind it so the
+/// caller plans from the newest picture rather than the oldest.
 fn await_progress(
     opt: &mut impl Optical,
     offer: &Offer,
@@ -174,8 +175,17 @@ fn await_progress(
     timeout: Duration,
 ) -> Result<()> {
     let deadline = Instant::now() + timeout;
-    while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
-        match opt.poll(remaining)? {
+    let mut got_one = false;
+    loop {
+        let wait = if got_one {
+            Duration::ZERO
+        } else {
+            match deadline.checked_duration_since(Instant::now()) {
+                Some(remaining) => remaining,
+                None => break,
+            }
+        };
+        match opt.poll(wait)? {
             Some(Payload::Progress {
                 transfer_id,
                 serial,
@@ -184,7 +194,7 @@ fn await_progress(
             }) if transfer_id == offer.transfer_id && *last_serial != Some(serial) => {
                 *last_serial = Some(serial);
                 if acked.apply_report(contiguous, &bitmaps).is_some() {
-                    return Ok(());
+                    got_one = true;
                 }
             }
             Some(Payload::Fail {
@@ -294,6 +304,8 @@ pub fn recv_blob(
     let mut unreported = false;
     let mut seen_data = false;
     let mut idle_rounds = 0;
+    let mut frames_since_report = 0;
+    let mut report_floor = store.have().contiguous();
     opt.set_status(&format!(
         "holding {held_at_start}/{} chunks; waiting for DATA",
         offer.chunk_count
@@ -317,6 +329,7 @@ pub fn recv_blob(
             }) if transfer_id == offer.transfer_id => {
                 seen_data = true;
                 idle_rounds = 0;
+                frames_since_report += 1;
                 // The frame CRC passed and the id matches, so a span that
                 // does not fit the offer is a protocol bug, not line noise.
                 let accepted = store
@@ -337,8 +350,14 @@ pub fn recv_blob(
                         start.elapsed(),
                     ));
                     let last = first + u32::from(count) - 1;
+                    // Report at the end of a burst, not when a window inside
+                    // it fills: the sender plans from the first report it
+                    // sees, so a mid-burst one makes it resend what is still
+                    // arriving. A burst ends at the edge of what one report
+                    // can describe or after BURST_FRAMES frames.
                     store.is_complete()
-                        || store.have().window_bits(last / WINDOW_CHUNKS) == u32::MAX
+                        || frames_since_report >= BURST_FRAMES
+                        || last + 1 >= report_limit(report_floor, windows, offer.chunk_count)
                 } else {
                     // Only repeats: the sender is resending what it thinks is
                     // missing, so it probably missed the last report.
@@ -404,6 +423,8 @@ pub fn recv_blob(
         if report_now {
             opt.show(&progress_payload(offer, store, windows))?;
             unreported = false;
+            frames_since_report = 0;
+            report_floor = store.have().contiguous();
             last_report = Instant::now();
         }
     }
@@ -413,6 +434,7 @@ pub fn recv_blob(
 mod tests {
     use super::*;
     use crate::{
+        chunks::WINDOW_CHUNKS,
         frame::{PROTOCOL_VERSION, ROLE_RECV},
         optical::{pair, Lossy},
     };
@@ -566,6 +588,32 @@ mod tests {
             })
             .collect();
         assert_eq!(&spans[..2], &[(0, 17), (17, 15)]);
+    }
+
+    #[test]
+    fn zero_loss_transfers_send_each_chunk_once_at_every_version() {
+        let blob = ramp(640 * crate::chunks::CHUNK_BYTES as u32);
+        for version in crate::qr::SUPPORTED_VERSIONS {
+            let session = session_for(&blob, version);
+            assert_eq!(session.offer.chunk_count, 640);
+            let (s, r) = pair();
+            let shown = Arc::new(Mutex::new(Vec::new()));
+            let recorder = Recorder {
+                inner: s,
+                shown: Arc::clone(&shown),
+            };
+            assert_delivered(transfer(recorder, r, &session, &blob), &blob);
+            let sent: u32 = shown
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|p| match p {
+                    Payload::Data { count, .. } => Some(u32::from(*count)),
+                    _ => None,
+                })
+                .sum();
+            assert_eq!(sent, 640, "QR v{version} resent chunks on a clean link");
+        }
     }
 
     #[test]
