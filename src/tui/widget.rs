@@ -7,7 +7,7 @@ use ratatui::{
 };
 use std::sync::Arc;
 
-use crate::qr;
+use crate::{qr, tui::layout::TileGrid};
 
 /// Maps a pair of vertically stacked "on" flags to the half-block glyph that
 /// paints them.
@@ -81,16 +81,18 @@ impl Widget for QrWidget<'_> {
     }
 }
 
-/// Several QR codes packed into one pane, used after the link when the
-/// camera preview is gone and leftover cells hold extra DATA frames.
+/// Several QR codes packed into the cells of a [`TileGrid`], used after the
+/// link. The grid comes from the shared layout, so the protocol never pages
+/// more codes than this draws.
 pub struct QrGridWidget<'a> {
     pub images: &'a [Arc<GrayImage>],
     pub invert: bool,
+    pub grid: TileGrid,
 }
 
 impl Widget for QrGridWidget<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        if area.width == 0 || area.height == 0 || self.images.is_empty() {
+        if area.width == 0 || area.height == 0 {
             return;
         }
         let quiet = Style::new().bg(Color::White).fg(Color::Black);
@@ -101,56 +103,25 @@ impl Widget for QrGridWidget<'_> {
                 }
             }
         }
-
-        let Some(first) = self.images.first() else {
-            return;
-        };
-        let modules = qr::modules_of(first);
-        let tile_w = modules as u16;
-        let tile_h = modules.div_ceil(2) as u16;
-        if tile_w == 0 || tile_h == 0 {
-            return;
-        }
-        let n = self.images.len();
-        let across_fit = (area.width / tile_w).max(1);
-        let down_fit = (area.height / tile_h).max(1);
-        let cap = (across_fit as usize).saturating_mul(down_fit as usize);
-        if tile_w > area.width || tile_h > area.height || cap == 0 {
-            Paragraph::new(format!(
-                "QR needs {tile_w}x{tile_h} cells, pane is {}x{}. Zoom out (Ctrl/- or Cmd/-) or enlarge the window.",
-                area.width, area.height
-            ))
-            .style(quiet)
-            .alignment(Alignment::Center)
-            .wrap(Wrap { trim: true })
-            .render(area, buf);
+        if self.grid.count() == 0 {
+            if !self.images.is_empty() {
+                Paragraph::new(format!(
+                    "QR needs {}x{} cells, pane is {}x{}. Zoom out (Ctrl/- or Cmd/-) or enlarge the window.",
+                    self.grid.tile_cols, self.grid.tile_rows, area.width, area.height
+                ))
+                .style(quiet)
+                .alignment(Alignment::Center)
+                .wrap(Wrap { trim: true })
+                .render(area, buf);
+            }
             return;
         }
-        // Never blank the pane: if we asked for more tiles than fit, draw
-        // the ones that do. tile_count is supposed to match, but ratatui's
-        // area can be a cell or two smaller than crossterm's size.
-        let shown = n.min(cap);
-        let across = across_fit.min(shown as u16).max(1);
-        let down = (shown as u16).div_ceil(across);
-        let grid_w = across.saturating_mul(tile_w);
-        let grid_h = down.saturating_mul(tile_h);
-
-        let origin_x = area.x + (area.width - grid_w) / 2;
-        let origin_y = area.y + (area.height - grid_h) / 2;
-        for (i, image) in self.images.iter().take(shown).enumerate() {
-            let col = i as u16 % across;
-            let row = i as u16 / across;
-            let cell = Rect {
-                x: origin_x + col * tile_w,
-                y: origin_y + row * tile_h,
-                width: tile_w,
-                height: tile_h,
-            };
+        for (index, image) in self.images.iter().take(self.grid.count()).enumerate() {
             QrWidget {
                 image: Some(image.as_ref()),
                 invert: self.invert,
             }
-            .render(cell, buf);
+            .render(self.grid.cell(area, index), buf);
         }
     }
 }
@@ -262,27 +233,79 @@ mod tests {
         );
     }
 
+    fn dark_cells(buf: &Buffer, rect: Rect) -> usize {
+        (rect.y..rect.bottom())
+            .flat_map(|y| (rect.x..rect.right()).map(move |x| (x, y)))
+            .filter(|&(x, y)| buf[(x, y)].symbol() != " ")
+            .count()
+    }
+
     #[test]
-    fn qr_grid_still_draws_one_code_when_the_pane_cannot_hold_the_whole_grid() {
-        let a = qr::encode_version(b"AX-a", 10).unwrap();
-        let b = qr::encode_version(b"AX-b", 10).unwrap();
+    fn a_grid_of_one_draws_one_code_even_when_given_more() {
+        let a = std::sync::Arc::new(qr::encode_version(b"AX-a", 10).unwrap());
+        let b = std::sync::Arc::new(qr::encode_version(b"AX-b", 10).unwrap());
         let (cols, rows) = qr::cell_size_for_version(10);
-        let images = [
-            std::sync::Arc::new(a),
-            std::sync::Arc::new(b),
-        ];
-        // Tall enough for one tile, not two stacked.
         let area = Rect::new(0, 0, cols, rows);
         let mut buf = Buffer::empty(area);
+        let grid = TileGrid {
+            across: 1,
+            down: 1,
+            tile_cols: cols,
+            tile_rows: rows,
+        };
         QrGridWidget {
-            images: &images,
+            images: &[a, b],
             invert: false,
+            grid,
         }
         .render(area, &mut buf);
-        let dark = (0..area.height)
-            .flat_map(|y| (0..area.width).map(move |x| (x, y)))
-            .filter(|&(x, y)| buf[(x, y)].symbol() != " ")
-            .count();
-        assert!(dark > 0, "expected at least one code to be drawn");
+        assert!(dark_cells(&buf, area) > 0);
+    }
+
+    #[test]
+    fn every_allocated_tile_is_drawn_whole() {
+        use crate::tui::layout::{data_tiles, plan, Phase, Tiles};
+        for (w, h) in [(140u16, 70u16), (200, 70), (330, 100), (66, 36)] {
+            for version in [10u8, 15] {
+                let area = Rect::new(0, 0, w, h);
+                let screen = plan(
+                    area,
+                    Phase::Linked,
+                    Tiles::Fill,
+                    qr::cell_size_for_version(version),
+                );
+                if screen.grid.count() == 0 {
+                    continue;
+                }
+                let n = data_tiles(area, Tiles::Fill, version);
+                assert_eq!(n, screen.grid.count());
+                let images: Vec<_> = (0..n)
+                    .map(|i| {
+                        std::sync::Arc::new(
+                            qr::encode_version(format!("AX-{i}").as_bytes(), version).unwrap(),
+                        )
+                    })
+                    .collect();
+                let mut buf = Buffer::empty(area);
+                QrGridWidget {
+                    images: &images,
+                    invert: false,
+                    grid: screen.grid,
+                }
+                .render(screen.qr, &mut buf);
+                for index in 0..n {
+                    let cell = screen.grid.cell(screen.qr, index);
+                    assert!(
+                        dark_cells(&buf, cell) > 0,
+                        "{w}x{h} v{version}: tile {index} missing"
+                    );
+                    assert!(
+                        (cell.x..cell.right())
+                            .all(|x| !buf[(x, cell.y)].symbol().contains("QR needs")),
+                        "tile {index} must be a code, not the enlarge message"
+                    );
+                }
+            }
+        }
     }
 }

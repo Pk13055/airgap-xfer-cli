@@ -5,6 +5,7 @@ use std::{
 };
 
 use image::GrayImage;
+use ratatui::layout::Rect;
 
 use crate::{
     frame::Payload,
@@ -12,7 +13,10 @@ use crate::{
     optical::Optical,
     qr,
     resume::UNSCOPED,
-    tui::camera::CameraFeed,
+    tui::{
+        camera::CameraFeed,
+        layout::{self, ScreenSize, Tiles},
+    },
     Error, Result,
 };
 
@@ -43,9 +47,12 @@ pub enum UiEvent {
         images: Vec<Arc<GrayImage>>,
         invert: bool,
         label: String,
-        /// After the link: drop the camera preview and transcript so the
-        /// codes can use the full pane.
-        compact: bool,
+        /// After the link: the side pane becomes the peer monitor and the
+        /// codes are tiled.
+        linked: bool,
+        /// The locked QR version, which sizes the tile grid when no image is
+        /// on screen yet.
+        version: u8,
         drawn: Sender<()>,
     },
     Status(String),
@@ -75,18 +82,29 @@ pub struct TuiOptical {
     events: Sender<UiEvent>,
     version: u8,
     invert: bool,
-    /// Set once the link is up: hide the preview and tile DATA frames.
-    compact: bool,
+    /// Set once the link is up.
+    linked: bool,
+    /// The area the UI last drew, for the tile count.
+    screen: Arc<ScreenSize>,
+    tiles: Tiles,
 }
 
 impl TuiOptical {
-    pub fn new(camera: Arc<CameraFeed>, events: Sender<UiEvent>, invert: bool) -> Self {
+    pub fn new(
+        camera: Arc<CameraFeed>,
+        events: Sender<UiEvent>,
+        invert: bool,
+        screen: Arc<ScreenSize>,
+        tiles: Tiles,
+    ) -> Self {
         Self {
             camera,
             events,
             version: 10,
             invert,
-            compact: false,
+            linked: false,
+            screen,
+            tiles,
         }
     }
 
@@ -133,7 +151,8 @@ impl TuiOptical {
             images,
             invert: self.invert,
             label,
-            compact: self.compact,
+            linked: self.linked,
+            version: self.version,
             drawn,
         })?;
         loop {
@@ -205,7 +224,7 @@ impl Optical for TuiOptical {
 
     fn set_version(&mut self, version: u8) {
         self.version = version;
-        self.compact = true;
+        self.linked = true;
         self.camera.set_multi(true);
     }
 
@@ -234,14 +253,15 @@ impl Optical for TuiOptical {
     }
 
     fn tile_count(&self) -> usize {
-        if !self.compact {
+        if !self.linked {
             return 1;
         }
-        let Ok((cols, rows)) = crossterm::terminal::size() else {
-            return 1;
-        };
-        let pane_rows = super::transfer_pane_rows(rows).saturating_sub(1);
-        qr::tiles_for_area(cols, pane_rows, self.version).max(1)
+        let area = self.screen.get().or_else(|| {
+            crossterm::terminal::size()
+                .ok()
+                .map(|(cols, rows)| Rect::new(0, 0, cols, rows))
+        });
+        area.map_or(1, |area| layout::data_tiles(area, self.tiles, self.version))
     }
 
     fn show_many(&mut self, payloads: &[Payload]) -> Result<()> {

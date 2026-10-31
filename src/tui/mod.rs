@@ -1,18 +1,22 @@
 //! A ratatui front end for the optical link.
 //!
 //! Terminals differ wildly in size, font, and colour theme, and a QR code is
-//! unforgiving about all three. Rendering through a fixed TUI layout instead
-//! of raw escape sequences gives both peers the same picture: a code drawn at
-//! exactly one cell per module on a forced white ground, a camera preview to
-//! aim with, and a transcript of the phases.
+//! unforgiving about all three. Every frame is laid out by [`layout::plan`]:
+//! outgoing codes in a left-hand column at exactly one cell per module on a
+//! forced white ground, and a side pane on the right — the camera preview
+//! while aiming, then a view of the peer once linked — that is dropped
+//! entirely, never squeezed into the codes, when the terminal is too
+//! narrow. The protocol thread sizes its DATA tile grid from the same plan.
 //!
 //! The transfer is not turn-based after aiming. The receiver shows HELLO
 //! straight away so the sender has a code to lock onto. The sender presses
-//! Enter after lock to begin the handshake, then once more to send the file. Handshake probes, ACKs, and
-//! the receive side then run unattended.
+//! Enter after lock to begin the handshake, then once more to send the file.
+//! Handshake probes, progress reports, reconnects and the receive side then
+//! run unattended.
 
 pub mod camera;
 pub mod gate;
+pub mod layout;
 pub mod optical;
 pub mod widget;
 
@@ -29,7 +33,6 @@ use crossterm::{
 };
 use image::GrayImage;
 use ratatui::{
-    layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Wrap},
@@ -41,24 +44,13 @@ use crate::{
     tui::{
         camera::CameraFeed,
         gate::{Gate, GateSpec, KeyAction},
+        layout::{Phase, Screen, ScreenSize, Tiles, BORDER, FLOOR_CHROME_ROWS},
         optical::{GateReply, TuiOptical, UiEvent},
         widget::{PreviewWidget, QrGridWidget, QrWidget},
     },
     Error, Result,
 };
 
-/// Rows the frame around the QR pane can never give up: the title line and a
-/// single line for the prompt. Everything else — the QR block's border, the
-/// footer hints, the prompt's own border, the transcript — is dropped in that
-/// order as the terminal gets shorter, because the QR code is the one element
-/// that cannot shrink without becoming undecodable.
-pub(crate) const FLOOR_CHROME_ROWS: u16 = 2;
-/// Rows the transcript takes when there is room to spare.
-const LOG_ROWS: u16 = 6;
-/// Rows (and columns) a bordered block consumes.
-const BORDER: u16 = 2;
-/// Below this the preview is dropped and the QR pane takes the full width.
-const MIN_PREVIEW_COLS: u16 = 24;
 /// How many transcript lines to keep.
 const LOG_LINES: usize = 200;
 
@@ -78,12 +70,6 @@ pub fn max_qr_version(cols: u16, rows: u16) -> Result<u8> {
             have_rows: rows,
         }
     })
-}
-
-/// Title + prompt kept during a transfer. `tile_count` and the compact layout
-/// must agree on this or the grid is computed larger than the pane.
-pub(crate) fn transfer_pane_rows(rows: u16) -> u16 {
-    rows.saturating_sub(FLOOR_CHROME_ROWS)
 }
 
 /// Waits until the terminal can draw the smallest usable QR, telling the
@@ -170,62 +156,6 @@ fn draw_resize_prompt(
     );
 }
 
-/// How much of the frame this terminal can afford around a `qr_rows` x
-/// `qr_cols` code, in rows (columns only for the QR block's border).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Chrome {
-    /// Border around the QR pane: 0 or [`BORDER`].
-    qr_border: u16,
-    /// Transcript height including its border, or 0.
-    log: u16,
-    /// Prompt height: 1 bare, or 1 + [`BORDER`] when boxed.
-    prompt: u16,
-    /// Key-hint footer: 0 or 1.
-    footer: u16,
-}
-
-impl Chrome {
-    /// Adds decoration in descending order of usefulness, stopping as soon as
-    /// the next piece would eat into the QR code.
-    ///
-    /// The transcript comes first because it is the only piece that carries
-    /// information the operator cannot get elsewhere; the title line already
-    /// names the frame on screen, and the key hints fold into the prompt when
-    /// there is no footer row, so both of those are decoration.
-    fn fit(width: u16, height: u16, qr_cols: u16, qr_rows: u16) -> Self {
-        let mut chrome = Chrome {
-            qr_border: 0,
-            log: 0,
-            prompt: 1,
-            footer: 0,
-        };
-        let mut spare = height.saturating_sub(FLOOR_CHROME_ROWS + qr_rows);
-
-        // A boxed transcript needs its border plus at least one line.
-        if spare > BORDER {
-            chrome.log = BORDER + 1;
-            spare -= BORDER + 1;
-        }
-        if spare >= BORDER && width >= qr_cols + BORDER {
-            chrome.qr_border = BORDER;
-            spare -= BORDER;
-        }
-        if spare >= 1 {
-            chrome.footer = 1;
-            spare -= 1;
-        }
-        if spare >= BORDER {
-            chrome.prompt += BORDER;
-            spare -= BORDER;
-        }
-        // Anything still going spare grows the transcript back up.
-        if chrome.log > 0 {
-            chrome.log += spare.min(LOG_ROWS.saturating_sub(chrome.log));
-        }
-        chrome
-    }
-}
-
 /// How aiming ends before the protocol thread starts the handshake.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Aim {
@@ -238,12 +168,23 @@ pub enum Aim {
     Immediate,
 }
 
+impl Aim {
+    /// The sender fills the screen with DATA codes; the receiver only ever
+    /// shows one progress report at a time.
+    fn tiles(self) -> Tiles {
+        match self {
+            Aim::EnterWhenLocked => Tiles::Fill,
+            Aim::Immediate => Tiles::One,
+        }
+    }
+}
+
 struct Ui {
     title: String,
     camera_index: u32,
-    /// The largest code this terminal agreed to display. The frame is sized
-    /// for it from the first draw, so the layout does not lurch when the first
-    /// QR appears or when a smaller version is negotiated.
+    /// The largest code this terminal agreed to display. The aiming layout
+    /// is sized for it from the first draw, so it does not lurch when the
+    /// first QR appears or when a smaller version is negotiated.
     max_version: u8,
     images: Vec<Arc<GrayImage>>,
     invert: bool,
@@ -252,9 +193,11 @@ struct Ui {
     log: Vec<String>,
     gate: Option<Gate>,
     done: Option<String>,
-    /// After the link: no camera preview, no transcript — the QR grid takes
-    /// the rest of the screen.
-    compact: bool,
+    /// After the link: tiled codes and the peer monitor.
+    linked: bool,
+    /// The locked QR version once linked.
+    version: u8,
+    tiles: Tiles,
 }
 
 impl Ui {
@@ -290,10 +233,19 @@ where
         }
     };
 
+    let tiles = aim.tiles();
+    let screen = Arc::new(ScreenSize::default());
     let (events_tx, events_rx) = mpsc::channel::<UiEvent>();
     let worker_feed = Arc::clone(&feed);
+    let worker_screen = Arc::clone(&screen);
     let worker = std::thread::spawn(move || {
-        let mut optical = TuiOptical::new(worker_feed, events_tx.clone(), no_invert);
+        let mut optical = TuiOptical::new(
+            worker_feed,
+            events_tx.clone(),
+            no_invert,
+            worker_screen,
+            tiles,
+        );
         let confirmed = {
             use crate::optical::Optical;
             match aim {
@@ -324,6 +276,7 @@ where
     let ui_result = event_loop(
         &mut terminal,
         &feed,
+        &screen,
         Ui {
             title: title.to_string(),
             camera_index,
@@ -335,7 +288,9 @@ where
             log: Vec::new(),
             gate: None,
             done: None,
-            compact: false,
+            linked: false,
+            version: max_version,
+            tiles,
         },
         &events_rx,
     );
@@ -390,6 +345,7 @@ fn leave<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>) {
 fn event_loop<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     feed: &CameraFeed,
+    screen: &ScreenSize,
     mut ui: Ui,
     events: &mpsc::Receiver<UiEvent>,
 ) -> Result<()> {
@@ -444,13 +400,15 @@ fn event_loop<B: ratatui::backend::Backend>(
                     images,
                     invert,
                     label,
-                    compact,
+                    linked,
+                    version,
                     drawn,
                 }) => {
                     ui.images = images;
                     ui.invert = invert;
                     ui.label = label;
-                    ui.compact = compact;
+                    ui.linked = linked;
+                    ui.version = version;
                     pending_draw_ack = Some(drawn);
                     dirty = true;
                     break;
@@ -497,12 +455,15 @@ fn event_loop<B: ratatui::backend::Backend>(
         }
 
         if dirty || last_draw.elapsed() >= Duration::from_millis(80) {
-            let preview = feed.preview();
-            let status = FeedStatus {
+            let view = FeedView {
                 counters: feed.counters(),
                 locked: feed.locked(),
+                preview: feed.preview(),
             };
-            terminal.draw(|frame| draw(frame, &ui, preview.as_deref(), status))?;
+            terminal.draw(|frame| {
+                screen.set(frame.area());
+                draw(frame, &ui, &view);
+            })?;
             last_draw = Instant::now();
         }
         if ui.done.is_none()
@@ -524,149 +485,140 @@ fn event_loop<B: ratatui::backend::Backend>(
     }
 }
 
-/// What the camera thread has to say about itself, for the title line.
-#[derive(Clone, Copy)]
-struct FeedStatus {
+/// What the camera thread has to say, sampled once per draw.
+struct FeedView {
     counters: (u64, u64),
     locked: bool,
+    preview: Option<Arc<GrayImage>>,
 }
 
-fn draw(frame: &mut ratatui::Frame, ui: &Ui, preview: Option<&GrayImage>, status: FeedStatus) {
-    let area = frame.area();
-    let (qr_cols, qr_rows) = if let Some(img) = ui.images.first() {
-        let modules = qr::modules_of(img) as u16;
-        (modules, modules.div_ceil(2))
-    } else {
-        qr::cell_size_for_version(ui.max_version)
-    };
-    let chrome = if ui.compact {
-        Chrome {
-            qr_border: 0,
-            log: 0,
-            prompt: 1,
-            footer: 0,
-        }
-    } else {
-        Chrome::fit(area.width, area.height, qr_cols, qr_rows)
-    };
+/// Terminal cells a rendered code occupies: one column per module, two
+/// modules per row.
+fn cells_of(image: &GrayImage) -> (u16, u16) {
+    let modules = qr::modules_of(image) as u16;
+    (modules, modules.div_ceil(2))
+}
 
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Min(qr_rows + chrome.qr_border),
-            Constraint::Length(chrome.log),
-            Constraint::Length(chrome.prompt),
-            Constraint::Length(chrome.footer),
-        ])
-        .split(area);
+fn draw(frame: &mut ratatui::Frame, ui: &Ui, view: &FeedView) {
+    // Linked frames are sized by what is actually on screen: a re-handshake
+    // after a fallback shows probes larger than the locked version.
+    let (phase, tile) = if ui.linked {
+        let tile = ui
+            .images
+            .first()
+            .map(|image| cells_of(image))
+            .unwrap_or_else(|| qr::cell_size_for_version(ui.version));
+        (Phase::Linked, tile)
+    } else {
+        (Phase::Aiming, qr::cell_size_for_version(ui.max_version))
+    };
+    let screen = layout::plan(frame.area(), phase, ui.tiles, tile);
+    draw_title(frame, ui, view, &screen);
+    draw_codes(frame, ui, &screen);
+    draw_side(frame, view, &screen);
+    draw_log(frame, ui, &screen);
+    draw_prompt(frame, ui, view, &screen);
+}
 
-    // The title line always carries what is on screen, because the QR block's
-    // own title disappears with its border on a short terminal.
-    let (frames, decodes) = status.counters;
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                format!(" {} ", ui.title),
-                Style::new()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(format!("  cam {}  ·  ", ui.camera_index)),
-            // Whether the peer's screen has been located is the single most
-            // useful thing to know while aiming a laptop lid.
-            if status.locked {
-                Span::styled("● tracking", Style::new().fg(Color::Green))
+fn draw_title(frame: &mut ratatui::Frame, ui: &Ui, view: &FeedView, screen: &Screen) {
+    let (frames, decodes) = view.counters;
+    let spans = vec![
+        Span::styled(
+            format!(" {} ", ui.title),
+            Style::new()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(format!("  cam {}  ·  ", ui.camera_index)),
+        if view.locked {
+            Span::styled("● tracking", Style::new().fg(Color::Green))
+        } else {
+            Span::styled("○ searching", Style::new().fg(Color::Yellow))
+        },
+        Span::raw(format!(
+            "  ·  {frames} frames  ·  {decodes} decodes{}",
+            if ui.label.is_empty() {
+                String::new()
             } else {
-                Span::styled("○ searching", Style::new().fg(Color::Yellow))
-            },
-            Span::raw(format!(
-                "  ·  {frames} frames  ·  {decodes} decodes{}",
-                if ui.label.is_empty() {
-                    String::new()
-                } else {
-                    format!("  ·  showing {}", ui.label)
-                }
-            )),
-        ])),
-        rows[0],
-    );
+                format!("  ·  showing {}", ui.label)
+            }
+        )),
+    ];
+    frame.render_widget(Paragraph::new(Line::from(spans)), screen.title);
+}
 
-    // After the link the camera preview goes away so the codes can use the
-    // full width. During aiming, leftover columns become the preview.
-    let needed_cols = qr_cols + chrome.qr_border;
-    let spare = rows[1].width.saturating_sub(needed_cols);
-    let middle = if !ui.compact && spare >= MIN_PREVIEW_COLS {
-        Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(needed_cols), Constraint::Min(0)])
-            .split(rows[1])
-    } else {
-        Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Min(0)])
-            .split(rows[1])
-    };
-
-    let qr_area = if chrome.qr_border > 0 {
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(format!(" showing {} ", ui.label));
-        let inner = block.inner(middle[0]);
-        frame.render_widget(block, middle[0]);
-        inner
-    } else {
-        middle[0]
-    };
-    if ui.images.len() > 1 {
+fn draw_codes(frame: &mut ratatui::Frame, ui: &Ui, screen: &Screen) {
+    if screen.chrome.qr_border > 0 {
+        frame.render_widget(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" showing {} ", ui.label)),
+            screen.qr_frame,
+        );
+    }
+    if ui.linked {
         frame.render_widget(
             QrGridWidget {
                 images: &ui.images,
                 invert: ui.invert,
+                grid: screen.grid,
             },
-            qr_area,
+            screen.qr,
         );
     } else {
         frame.render_widget(
             QrWidget {
-                image: ui.images.first().map(|img| img.as_ref()),
+                image: ui.images.first().map(|image| image.as_ref()),
                 invert: ui.invert,
             },
-            qr_area,
+            screen.qr,
         );
     }
+}
 
-    if middle.len() > 1 && !ui.compact {
-        let preview_area = if chrome.qr_border > 0 {
-            let block = Block::default().borders(Borders::ALL).title(" camera ");
-            let inner = block.inner(middle[1]);
-            frame.render_widget(block, middle[1]);
-            inner
-        } else {
-            middle[1]
-        };
-        frame.render_widget(PreviewWidget { frame: preview }, preview_area);
+fn draw_side(frame: &mut ratatui::Frame, view: &FeedView, screen: &Screen) {
+    let Some(side) = screen.side else {
+        return;
+    };
+    let inner = if screen.chrome.qr_border > 0 {
+        let block = Block::default().borders(Borders::ALL).title(" camera ");
+        let inner = block.inner(side);
+        frame.render_widget(block, side);
+        inner
+    } else {
+        side
+    };
+    frame.render_widget(
+        PreviewWidget {
+            frame: view.preview.as_deref(),
+        },
+        inner,
+    );
+}
+
+fn draw_log(frame: &mut ratatui::Frame, ui: &Ui, screen: &Screen) {
+    if screen.chrome.log == 0 {
+        return;
     }
+    let visible = screen.log.height.saturating_sub(BORDER) as usize;
+    let start = ui.log.len().saturating_sub(visible);
+    frame.render_widget(
+        Paragraph::new(
+            ui.log[start..]
+                .iter()
+                .map(|line| Line::raw(line.clone()))
+                .collect::<Vec<_>>(),
+        )
+        .block(Block::default().borders(Borders::ALL).title(" transcript ")),
+        screen.log,
+    );
+}
 
-    if chrome.log > 0 {
-        let visible = chrome.log.saturating_sub(BORDER) as usize;
-        let start = ui.log.len().saturating_sub(visible);
-        frame.render_widget(
-            Paragraph::new(
-                ui.log[start..]
-                    .iter()
-                    .map(|line| Line::raw(line.clone()))
-                    .collect::<Vec<_>>(),
-            )
-            .block(Block::default().borders(Borders::ALL).title(" transcript ")),
-            rows[2],
-        );
-    }
-
+fn draw_prompt(frame: &mut ratatui::Frame, ui: &Ui, view: &FeedView, screen: &Screen) {
     let hints = match (&ui.done, &ui.gate) {
         (Some(_), _) => "any key: exit",
-        (None, Some(gate)) if gate.spec.require_lock && !status.locked => {
+        (None, Some(gate)) if gate.spec.require_lock && !view.locked => {
             "keep aiming until ● tracking   Esc: abort   q: quit"
         }
         (None, Some(gate)) if gate.spec.auto_on_lock => "Esc: abort   q: quit",
@@ -675,7 +627,7 @@ fn draw(frame: &mut ratatui::Frame, ui: &Ui, preview: Option<&GrayImage>, status
     };
     let (prompt_style, mut prompt) = match (&ui.done, &ui.gate) {
         (Some(summary), _) => (Style::new().fg(Color::Cyan), summary.clone()),
-        (None, Some(gate)) if gate.spec.require_lock && !status.locked => (
+        (None, Some(gate)) if gate.spec.require_lock && !view.locked => (
             Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
             if gate.spec.auto_on_lock {
                 "▶ Aim at the other terminal until tracking locks — receive starts on its own"
@@ -684,7 +636,7 @@ fn draw(frame: &mut ratatui::Frame, ui: &Ui, preview: Option<&GrayImage>, status
                 "▶ Aim at the other terminal until tracking locks, then press Enter".into()
             },
         ),
-        (None, Some(gate)) if gate.spec.require_lock && status.locked => (
+        (None, Some(gate)) if gate.spec.require_lock && view.locked => (
             Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
             format!("▶ Tracking locked. {}", gate.prompt),
         ),
@@ -701,7 +653,7 @@ fn draw(frame: &mut ratatui::Frame, ui: &Ui, preview: Option<&GrayImage>, status
             },
         ),
     };
-    if chrome.footer == 0 {
+    if screen.chrome.footer == 0 {
         // No footer row to spare: fold the key hints into the prompt so the
         // operator can still see that Enter is what moves things along.
         prompt = format!("{prompt}   [{hints}]");
@@ -710,18 +662,17 @@ fn draw(frame: &mut ratatui::Frame, ui: &Ui, preview: Option<&GrayImage>, status
         .style(prompt_style)
         .wrap(Wrap { trim: true });
     frame.render_widget(
-        if chrome.prompt > 1 {
+        if screen.chrome.prompt > 1 {
             prompt_widget.block(Block::default().borders(Borders::ALL).title(" prompt "))
         } else {
             prompt_widget
         },
-        rows[3],
+        screen.prompt,
     );
-
-    if chrome.footer > 0 {
+    if screen.chrome.footer > 0 {
         frame.render_widget(
             Paragraph::new(Span::styled(hints, Style::new().fg(Color::DarkGray))),
-            rows[4],
+            screen.footer,
         );
     }
 }
@@ -729,6 +680,7 @@ fn draw(frame: &mut ratatui::Frame, ui: &Ui, preview: Option<&GrayImage>, status
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::backend::TestBackend;
 
     #[test]
     fn max_qr_version_only_reserves_rows_the_layout_cannot_give_up() {
@@ -759,57 +711,73 @@ mod tests {
         }
     }
 
-    #[test]
-    fn chrome_sheds_decoration_from_the_outside_in_and_never_squeezes_the_code() {
-        let (cols, rows) = qr::cell_size_for_version(10);
+    fn ui_for(linked: bool, images: Vec<Arc<GrayImage>>, tiles: Tiles) -> Ui {
+        Ui {
+            title: "t".into(),
+            camera_index: 0,
+            max_version: 10,
+            images,
+            invert: false,
+            label: String::new(),
+            status: String::new(),
+            log: Vec::new(),
+            gate: None,
+            done: None,
+            linked,
+            version: 10,
+            tiles,
+        }
+    }
 
-        // Roomy: everything on.
-        let roomy = Chrome::fit(200, 60, cols, rows);
-        assert_eq!(roomy.qr_border, BORDER);
-        assert_eq!(roomy.footer, 1);
-        assert_eq!(roomy.prompt, 1 + BORDER);
-        assert_eq!(roomy.log, LOG_ROWS);
+    fn render(cols: u16, rows: u16, ui: &Ui) -> ratatui::buffer::Buffer {
+        let view = FeedView {
+            counters: (0, 0),
+            locked: false,
+            preview: None,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(cols, rows)).unwrap();
+        terminal.draw(|frame| draw(frame, ui, &view)).unwrap();
+        terminal.backend().buffer().clone()
+    }
 
-        // The reported terminal has three rows to spare: they go to the
-        // transcript rather than to a border, because only the transcript
-        // says anything the rest of the frame does not.
-        let reported = Chrome::fit(148, 38, cols, rows);
-        assert_eq!(reported.log, BORDER + 1);
-        assert_eq!(reported.qr_border, 0);
-        assert_eq!(reported.footer, 0);
-        assert_eq!(reported.prompt, 1);
+    fn text(buf: &ratatui::buffer::Buffer) -> String {
+        let area = buf.area;
+        (area.y..area.bottom())
+            .map(|y| {
+                (area.x..area.right())
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 
-        // Exactly at the floor: nothing but the title and one prompt line.
-        let tight = Chrome::fit(cols, rows + FLOOR_CHROME_ROWS, cols, rows);
-        assert_eq!(
-            tight,
-            Chrome {
-                qr_border: 0,
-                log: 0,
-                prompt: 1,
-                footer: 0
-            }
-        );
-
-        // Wide but short: the border costs rows it does not have.
-        assert_eq!(
-            Chrome::fit(400, rows + FLOOR_CHROME_ROWS, cols, rows).qr_border,
-            0
-        );
-        // Tall but narrow: the border costs columns it does not have.
-        assert_eq!(Chrome::fit(cols, 100, cols, rows).qr_border, 0);
+    fn code_at(buf: &ratatui::buffer::Buffer, x: u16) -> bool {
+        (0..buf.area.height).any(|y| {
+            let cell = &buf[(x, y)];
+            cell.bg == Color::White && matches!(cell.symbol(), "█" | "▀" | "▄")
+        })
     }
 
     #[test]
-    fn every_chrome_layout_leaves_the_code_its_full_height() {
-        let (cols, rows) = qr::cell_size_for_version(10);
-        for height in (rows + FLOOR_CHROME_ROWS)..=(rows + 30) {
-            let chrome = Chrome::fit(148, height, cols, rows);
-            let used = 1 + chrome.log + chrome.prompt + chrome.footer + chrome.qr_border;
-            assert!(
-                used + rows <= height,
-                "chrome {chrome:?} overflows a {height}-row terminal"
-            );
-        }
+    fn while_aiming_the_code_is_on_the_left_and_the_camera_on_the_right() {
+        let image = Arc::new(qr::encode_version(b"AX-aim", 10).unwrap());
+        let buf = render(148, 38, &ui_for(false, vec![image], Tiles::Fill));
+        assert!(code_at(&buf, 10));
+        assert!(
+            (65..148).all(|x| !code_at(&buf, x)),
+            "nothing scannable in the side pane"
+        );
+        assert!(text(&buf).contains("waiting for camera"));
+    }
+
+    #[test]
+    fn a_narrow_terminal_drops_the_side_pane_and_keeps_the_code_whole() {
+        let image = Arc::new(qr::encode_version(b"AX-narrow", 10).unwrap());
+        let buf = render(80, 38, &ui_for(false, vec![image], Tiles::Fill));
+        let text = text(&buf);
+        assert!(!text.contains("waiting for camera"));
+        assert!(!text.contains("QR needs"), "the code must not be clipped");
+        assert!((0..80).any(|x| code_at(&buf, x)), "the code is still drawn");
     }
 }
