@@ -222,10 +222,15 @@ impl ChunkStore {
     /// An empty store for an archive of `size` bytes, or `None` when that
     /// cannot be held in memory on this machine.
     pub fn new(size: u64) -> Option<Self> {
+        let count = chunk_count(size)?;
+        let len = usize::try_from(size).ok()?;
+        let mut blob = Vec::new();
+        blob.try_reserve_exact(len).ok()?;
+        blob.resize(len, 0);
         Some(Self {
             size,
-            blob: vec![0; usize::try_from(size).ok()?],
-            have: ChunkSet::new(chunk_count(size)?),
+            blob,
+            have: ChunkSet::new(count),
             conflicts: 0,
             serial: 0,
         })
@@ -443,6 +448,12 @@ mod tests {
         assert_eq!(store.accept(0, 1, &[0; 95]), Err(SpanError::WrongLength));
         assert_eq!(store.accept(3, 1, &[0; 8]), Err(SpanError::OutOfRange));
         assert_eq!(store.have().count(), 0);
+    }
+
+    #[test]
+    fn new_store_rejects_sizes_that_cannot_be_numbered_or_held() {
+        assert!(ChunkStore::new(u64::from(u32::MAX) * 96 + 1).is_none());
+        assert!(ChunkStore::new(u64::MAX).is_none());
     }
 
     #[test]
