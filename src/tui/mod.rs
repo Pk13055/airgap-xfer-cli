@@ -17,6 +17,7 @@
 pub mod camera;
 pub mod gate;
 pub mod layout;
+pub mod monitor;
 pub mod optical;
 pub mod widget;
 
@@ -42,9 +43,10 @@ use ratatui::{
 use crate::{
     live, qr,
     tui::{
-        camera::CameraFeed,
+        camera::{CameraFeed, PeerCrop},
         gate::{Gate, GateSpec, KeyAction},
         layout::{Phase, Screen, ScreenSize, Tiles, BORDER, FLOOR_CHROME_ROWS},
+        monitor::{freshness, tint, Freshness, MonitorWidget},
         optical::{GateReply, TuiOptical, UiEvent},
         widget::{PreviewWidget, QrGridWidget, QrWidget},
     },
@@ -459,6 +461,8 @@ fn event_loop<B: ratatui::backend::Backend>(
                 counters: feed.counters(),
                 locked: feed.locked(),
                 preview: feed.preview(),
+                crop: feed.peer_crop(),
+                now: Instant::now(),
             };
             terminal.draw(|frame| {
                 screen.set(frame.area());
@@ -490,6 +494,8 @@ struct FeedView {
     counters: (u64, u64),
     locked: bool,
     preview: Option<Arc<GrayImage>>,
+    crop: Option<PeerCrop>,
+    now: Instant,
 }
 
 /// Terminal cells a rendered code occupies: one column per module, two
@@ -515,14 +521,14 @@ fn draw(frame: &mut ratatui::Frame, ui: &Ui, view: &FeedView) {
     let screen = layout::plan(frame.area(), phase, ui.tiles, tile);
     draw_title(frame, ui, view, &screen);
     draw_codes(frame, ui, &screen);
-    draw_side(frame, view, &screen);
+    draw_side(frame, ui, view, &screen);
     draw_log(frame, ui, &screen);
     draw_prompt(frame, ui, view, &screen);
 }
 
 fn draw_title(frame: &mut ratatui::Frame, ui: &Ui, view: &FeedView, screen: &Screen) {
     let (frames, decodes) = view.counters;
-    let spans = vec![
+    let mut spans = vec![
         Span::styled(
             format!(" {} ", ui.title),
             Style::new()
@@ -545,6 +551,17 @@ fn draw_title(frame: &mut ratatui::Frame, ui: &Ui, view: &FeedView, screen: &Scr
             }
         )),
     ];
+    if ui.linked {
+        spans.push(match &view.crop {
+            Some(crop) if freshness(crop.at, view.now, view.locked) == Freshness::Live => {
+                Span::styled("  ·  peer view live", Style::new().fg(tint(crop.epoch)))
+            }
+            _ => Span::styled(
+                "  ·  peer view STALE, reacquiring",
+                Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ),
+        });
+    }
     frame.render_widget(Paragraph::new(Line::from(spans)), screen.title);
 }
 
@@ -577,10 +594,23 @@ fn draw_codes(frame: &mut ratatui::Frame, ui: &Ui, screen: &Screen) {
     }
 }
 
-fn draw_side(frame: &mut ratatui::Frame, view: &FeedView, screen: &Screen) {
+fn draw_side(frame: &mut ratatui::Frame, ui: &Ui, view: &FeedView, screen: &Screen) {
     let Some(side) = screen.side else {
         return;
     };
+    if ui.linked {
+        // After the link the full preview gives way to a view of just the
+        // peer's code, and it stays this way through any reconnect.
+        frame.render_widget(
+            MonitorWidget {
+                crop: view.crop.as_ref(),
+                locked: view.locked,
+                now: view.now,
+            },
+            side,
+        );
+        return;
+    }
     let inner = if screen.chrome.qr_border > 0 {
         let block = Block::default().borders(Borders::ALL).title(" camera ");
         let inner = block.inner(side);
@@ -734,9 +764,15 @@ mod tests {
             counters: (0, 0),
             locked: false,
             preview: None,
+            crop: None,
+            now: Instant::now(),
         };
+        render_with(cols, rows, ui, &view)
+    }
+
+    fn render_with(cols: u16, rows: u16, ui: &Ui, view: &FeedView) -> ratatui::buffer::Buffer {
         let mut terminal = Terminal::new(TestBackend::new(cols, rows)).unwrap();
-        terminal.draw(|frame| draw(frame, ui, &view)).unwrap();
+        terminal.draw(|frame| draw(frame, ui, view)).unwrap();
         terminal.backend().buffer().clone()
     }
 
@@ -779,5 +815,35 @@ mod tests {
         assert!(!text.contains("waiting for camera"));
         assert!(!text.contains("QR needs"), "the code must not be clipped");
         assert!((0..80).any(|x| code_at(&buf, x)), "the code is still drawn");
+    }
+
+    #[test]
+    fn once_linked_the_preview_becomes_a_monitor_that_goes_stale_visibly() {
+        let image = Arc::new(qr::encode_version(b"AX-linked", 10).unwrap());
+        let ui = ui_for(true, vec![image], Tiles::One);
+        let t0 = Instant::now();
+        let view = FeedView {
+            counters: (0, 0),
+            locked: false,
+            preview: None,
+            crop: Some(PeerCrop {
+                image: Arc::new(GrayImage::from_pixel(96, 96, image::Luma([0]))),
+                epoch: 2,
+                at: t0,
+            }),
+            now: t0 + Duration::from_secs(2),
+        };
+        let buf = render_with(148, 38, &ui, &view);
+        let text = text(&buf);
+        assert!(
+            !text.contains("waiting for camera"),
+            "no full preview after the link"
+        );
+        assert!(text.contains("STALE"), "{text}");
+        assert!(text.contains("reacquiring"));
+        assert!(
+            (65..148).all(|x| !code_at(&buf, x)),
+            "the monitor is never a scannable code"
+        );
     }
 }
