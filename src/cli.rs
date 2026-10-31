@@ -17,10 +17,15 @@ use crate::{
 const SIZE_NOTE: &str = "Both terminals need at least 65x35 cells: the smallest usable QR code is \
 65x33 on its own, and a clipped code cannot be read by the other camera. If \
 the window is smaller, airgap-xfer waits and asks you to zoom out (Ctrl/- or \
-Cmd/-) or stretch the window. After the link, the camera preview hides and \
-the sender fills the screen with as many codes as fit. The receiver shows \
-its code at once. Aim the sender until tracking locks, press Enter, then one \
-more Enter to send. Esc aborts, q quits.";
+Cmd/-) or stretch the window. Outgoing codes stay in the left column. While \
+aiming, the right side shows the camera; once linked it becomes a fuzzy view \
+of the other side's code as your camera sees it. It changes colour when a new \
+code is read and is labelled STALE when tracking drops. On a narrow terminal \
+that pane is hidden rather than squeezing the codes. Aim the sender until \
+tracking locks, press Enter, then Enter once more to send; the receiver \
+accepts on its own. If the link drops (camera covered, lid bumped, fallback \
+to a smaller code) both sides reconnect by themselves and keep what was \
+already received, as long as both stay open. Esc aborts, q quits.";
 
 #[derive(Parser, Debug)]
 #[command(name = "airgap-xfer", version, after_help = SIZE_NOTE)]
@@ -238,5 +243,27 @@ mod tests {
             }
             _ => panic!("expected recv"),
         }
+    }
+
+    #[test]
+    fn no_command_line_options_were_added() {
+        use clap::CommandFactory;
+        let cli = Cli::command();
+        let names = |sub: &str| -> Vec<String> {
+            let mut names: Vec<String> = cli
+                .find_subcommand(sub)
+                .unwrap()
+                .get_arguments()
+                .map(|arg| arg.get_id().to_string())
+                .filter(|id| id != "help" && id != "version")
+                .collect();
+            names.sort();
+            names
+        };
+        assert_eq!(names("send"), ["camera", "keep_temp", "no_invert", "path"]);
+        assert_eq!(
+            names("recv"),
+            ["camera", "force", "keep_temp", "no_invert", "outdir"]
+        );
     }
 }
