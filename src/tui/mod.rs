@@ -12,6 +12,7 @@
 //! the receive side then run unattended.
 
 pub mod camera;
+pub mod gate;
 pub mod optical;
 pub mod widget;
 
@@ -39,6 +40,7 @@ use crate::{
     live, qr,
     tui::{
         camera::CameraFeed,
+        gate::{Gate, GateSpec, KeyAction},
         optical::{GateReply, TuiOptical, UiEvent},
         widget::{PreviewWidget, QrGridWidget, QrWidget},
     },
@@ -87,9 +89,7 @@ pub(crate) fn transfer_pane_rows(rows: u16) -> u16 {
 /// Waits until the terminal can draw the smallest usable QR, telling the
 /// operator to zoom out or stretch the window. Returns the largest version
 /// that now fits.
-fn wait_for_terminal_size<B: ratatui::backend::Backend>(
-    terminal: &mut Terminal<B>,
-) -> Result<u8> {
+fn wait_for_terminal_size<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>) -> Result<u8> {
     loop {
         live::check_interrupted()?;
         let (cols, rows) = crossterm::terminal::size()?;
@@ -238,13 +238,6 @@ pub enum Aim {
     Immediate,
 }
 
-struct Gate {
-    prompt: String,
-    reply: mpsc::Sender<GateReply>,
-    require_lock: bool,
-    auto_on_lock: bool,
-}
-
 struct Ui {
     title: String,
     camera_index: u32,
@@ -354,9 +347,9 @@ where
     // those senders and lets it unwind instead of deadlocking the join.
     drop(events_rx);
 
-    let work_result = worker.join().unwrap_or_else(|_| {
-        Err(Error::Message("protocol thread panicked".into()))
-    });
+    let work_result = worker
+        .join()
+        .unwrap_or_else(|_| Err(Error::Message("protocol thread panicked".into())));
     // The protocol's own error is the interesting one; a UI error only
     // matters if the protocol somehow succeeded anyway.
     work_result.and_then(|summary| {
@@ -386,11 +379,7 @@ fn enter() -> Result<Terminal<ratatui::backend::CrosstermBackend<Stdout>>> {
 
 fn restore() {
     let _ = disable_raw_mode();
-    let _ = execute!(
-        io::stdout(),
-        LeaveAlternateScreen,
-        crossterm::cursor::Show
-    );
+    let _ = execute!(io::stdout(), LeaveAlternateScreen, crossterm::cursor::Show);
 }
 
 fn leave<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>) {
@@ -428,26 +417,18 @@ fn event_loop<B: ratatui::backend::Backend>(
                     ui.gate = None;
                     return Ok(());
                 }
-                match key.code {
-                    KeyCode::Enter => {
-                        let allow = match &ui.gate {
-                            Some(gate) if gate.auto_on_lock => false,
-                            Some(gate) if gate.require_lock => feed.locked(),
-                            Some(_) => true,
-                            None => false,
-                        };
-                        if allow {
-                            if let Some(gate) = ui.gate.take() {
-                                let _ = gate.reply.send(GateReply::Proceed);
-                            }
-                        }
+                let action = ui.gate.as_ref().map_or(KeyAction::Ignore, |gate| {
+                    gate::on_key(&gate.spec, key.code, feed.locked(), Instant::now())
+                });
+                let reply = match action {
+                    KeyAction::Proceed => Some(GateReply::Proceed),
+                    KeyAction::Abort => Some(GateReply::Abort),
+                    KeyAction::Ignore => None,
+                };
+                if let Some(reply) = reply {
+                    if let Some(gate) = ui.gate.take() {
+                        let _ = gate.reply.send(reply);
                     }
-                    KeyCode::Esc => {
-                        if let Some(gate) = ui.gate.take() {
-                            let _ = gate.reply.send(GateReply::Abort);
-                        }
-                    }
-                    _ => {}
                 }
             } else {
                 dirty = true;
@@ -491,8 +472,11 @@ fn event_loop<B: ratatui::backend::Backend>(
                     ui.gate = Some(Gate {
                         prompt,
                         reply,
-                        require_lock,
-                        auto_on_lock,
+                        spec: GateSpec {
+                            require_lock,
+                            auto_on_lock,
+                            armed_at: Instant::now(),
+                        },
                     });
                     dirty = true;
                 }
@@ -522,8 +506,10 @@ fn event_loop<B: ratatui::backend::Backend>(
             last_draw = Instant::now();
         }
         if ui.done.is_none()
-            && matches!(&ui.gate, Some(gate) if gate.auto_on_lock)
-            && feed.locked()
+            && ui
+                .gate
+                .as_ref()
+                .is_some_and(|gate| gate::auto_proceed(&gate.spec, feed.locked()))
         {
             if let Some(gate) = ui.gate.take() {
                 let _ = gate.reply.send(GateReply::Proceed);
@@ -545,12 +531,7 @@ struct FeedStatus {
     locked: bool,
 }
 
-fn draw(
-    frame: &mut ratatui::Frame,
-    ui: &Ui,
-    preview: Option<&GrayImage>,
-    status: FeedStatus,
-) {
+fn draw(frame: &mut ratatui::Frame, ui: &Ui, preview: Option<&GrayImage>, status: FeedStatus) {
     let area = frame.area();
     let (qr_cols, qr_rows) = if let Some(img) = ui.images.first() {
         let modules = qr::modules_of(img) as u16;
@@ -685,25 +666,25 @@ fn draw(
 
     let hints = match (&ui.done, &ui.gate) {
         (Some(_), _) => "any key: exit",
-        (None, Some(gate)) if gate.require_lock && !status.locked => {
+        (None, Some(gate)) if gate.spec.require_lock && !status.locked => {
             "keep aiming until ● tracking   Esc: abort   q: quit"
         }
-        (None, Some(gate)) if gate.auto_on_lock => "Esc: abort   q: quit",
+        (None, Some(gate)) if gate.spec.auto_on_lock => "Esc: abort   q: quit",
         (None, Some(_)) => "Enter: continue   Esc: abort   q: quit",
         (None, None) => "q: quit",
     };
     let (prompt_style, mut prompt) = match (&ui.done, &ui.gate) {
         (Some(summary), _) => (Style::new().fg(Color::Cyan), summary.clone()),
-        (None, Some(gate)) if gate.require_lock && !status.locked => (
+        (None, Some(gate)) if gate.spec.require_lock && !status.locked => (
             Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-            if gate.auto_on_lock {
+            if gate.spec.auto_on_lock {
                 "▶ Aim at the other terminal until tracking locks — receive starts on its own"
                     .into()
             } else {
                 "▶ Aim at the other terminal until tracking locks, then press Enter".into()
             },
         ),
-        (None, Some(gate)) if gate.require_lock && status.locked => (
+        (None, Some(gate)) if gate.spec.require_lock && status.locked => (
             Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
             format!("▶ Tracking locked. {}", gate.prompt),
         ),
@@ -811,7 +792,10 @@ mod tests {
         );
 
         // Wide but short: the border costs rows it does not have.
-        assert_eq!(Chrome::fit(400, rows + FLOOR_CHROME_ROWS, cols, rows).qr_border, 0);
+        assert_eq!(
+            Chrome::fit(400, rows + FLOOR_CHROME_ROWS, cols, rows).qr_border,
+            0
+        );
         // Tall but narrow: the border costs columns it does not have.
         assert_eq!(Chrome::fit(cols, 100, cols, rows).qr_border, 0);
     }
