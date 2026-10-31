@@ -542,26 +542,30 @@ fn draw_title(frame: &mut ratatui::Frame, ui: &Ui, view: &FeedView, screen: &Scr
         } else {
             Span::styled("○ searching", Style::new().fg(Color::Yellow))
         },
-        Span::raw(format!(
-            "  ·  {frames} frames  ·  {decodes} decodes{}",
-            if ui.label.is_empty() {
-                String::new()
-            } else {
-                format!("  ·  showing {}", ui.label)
-            }
-        )),
     ];
     if ui.linked {
+        // Right after the tracking indicator: on ~80-col terminals the side
+        // pane is hidden and this is the only stale indicator, so it must
+        // not sit where the counters can push it off the row.
         spans.push(match &view.crop {
+            None => Span::styled("  ·  peer view waiting", Style::new().fg(Color::DarkGray)),
             Some(crop) if freshness(crop.at, view.now, view.locked) == Freshness::Live => {
                 Span::styled("  ·  peer view live", Style::new().fg(tint(crop.epoch)))
             }
-            _ => Span::styled(
+            Some(_) => Span::styled(
                 "  ·  peer view STALE, reacquiring",
                 Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
             ),
         });
     }
+    spans.push(Span::raw(format!(
+        "  ·  {frames} frames  ·  {decodes} decodes{}",
+        if ui.label.is_empty() {
+            String::new()
+        } else {
+            format!("  ·  showing {}", ui.label)
+        }
+    )));
     frame.render_widget(Paragraph::new(Line::from(spans)), screen.title);
 }
 
@@ -839,11 +843,51 @@ mod tests {
             !text.contains("waiting for camera"),
             "no full preview after the link"
         );
-        assert!(text.contains("STALE"), "{text}");
-        assert!(text.contains("reacquiring"));
+        assert!(
+            text.contains("◌ STALE 2s"),
+            "monitor header missing: {text}"
+        );
+        let dimmed_ascii = (65..148).any(|x| {
+            (0..buf.area.height).any(|y| {
+                let cell = &buf[(x, y)];
+                cell.symbol() == "@"
+                    && cell.fg == Color::DarkGray
+                    && cell.modifier.contains(Modifier::DIM)
+            })
+        });
+        assert!(
+            dimmed_ascii,
+            "stale crop must be drawn dimmed in the side pane"
+        );
         assert!(
             (65..148).all(|x| !code_at(&buf, x)),
             "the monitor is never a scannable code"
         );
+    }
+
+    #[test]
+    fn the_title_row_carries_the_peer_view_state_on_a_narrow_terminal() {
+        let image = Arc::new(qr::encode_version(b"AX-title", 10).unwrap());
+        let ui = ui_for(true, vec![image], Tiles::One);
+        let t0 = Instant::now();
+        let mut view = FeedView {
+            counters: (123456, 7890),
+            locked: false,
+            preview: None,
+            crop: Some(PeerCrop {
+                image: Arc::new(GrayImage::from_pixel(96, 96, image::Luma([0]))),
+                epoch: 2,
+                at: t0,
+            }),
+            now: t0 + Duration::from_secs(2),
+        };
+        let row = |buf: &ratatui::buffer::Buffer| {
+            (0..80).map(|x| buf[(x, 0)].symbol()).collect::<String>()
+        };
+        let title = row(&render_with(80, 38, &ui, &view));
+        assert!(title.contains("peer view STALE"), "{title}");
+        view.crop = None;
+        let title = row(&render_with(80, 38, &ui, &view));
+        assert!(title.contains("peer view waiting"), "{title}");
     }
 }
