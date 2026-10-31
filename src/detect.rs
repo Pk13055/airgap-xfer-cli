@@ -38,6 +38,20 @@ pub struct Quad {
 }
 
 impl Quad {
+    /// Enclosed area in square pixels (shoelace formula).
+    pub fn area(&self) -> f32 {
+        let c = &self.corners;
+        ((0..4)
+            .map(|i| {
+                let (x0, y0) = c[i];
+                let (x1, y1) = c[(i + 1) % 4];
+                x0 * y1 - x1 * y0
+            })
+            .sum::<f32>()
+            / 2.0)
+            .abs()
+    }
+
     /// Longest edge in pixels, used to size the rectified image.
     pub fn longest_edge(&self) -> f32 {
         (0..4)
@@ -254,6 +268,7 @@ fn sample_bilinear(frame: &GrayImage, x: f32, y: f32) -> u8 {
 #[derive(Default)]
 pub struct Tracker {
     quad: Option<Quad>,
+    region: Option<Quad>,
     misses: u32,
 }
 
@@ -265,6 +280,12 @@ impl Tracker {
     /// Whether the peer's screen is currently being tracked.
     pub fn locked(&self) -> bool {
         self.quad.is_some()
+    }
+
+    /// Where the peer's code(s) were last read, kept after the lock drops so
+    /// the monitor can go on showing the last place it saw them.
+    pub fn region(&self) -> Option<Quad> {
+        self.region
     }
 
     /// Decodes whatever QR code is in `frame`, tracking its position.
@@ -279,6 +300,7 @@ impl Tracker {
             let cropped = rectify(frame, &quad, size);
             if let Ok((bytes, points)) = qr::decode_with_points(&cropped) {
                 self.quad = project_back(&quad, &points, size).or(Some(quad));
+                self.region = self.quad;
                 self.misses = 0;
                 return Some(bytes);
             }
@@ -292,6 +314,7 @@ impl Tracker {
 
         let (bytes, points) = qr::decode_with_points(frame).ok()?;
         self.quad = order_quad(&points);
+        self.region = self.quad.or(self.region);
         Some(bytes)
     }
 
@@ -303,11 +326,53 @@ impl Tracker {
             if let Some((_, points)) = found.first() {
                 self.quad = order_quad(points).or(self.quad);
             }
+            let region = if found.len() == 1 {
+                found.first().and_then(|(_, points)| order_quad(points))
+            } else {
+                let all: Vec<(f32, f32)> = found
+                    .iter()
+                    .flat_map(|(_, points)| points.iter().copied())
+                    .collect();
+                hull_quad(&all)
+            };
+            self.region = region.or(self.region);
             self.misses = 0;
             return found.into_iter().map(|(bytes, _)| bytes).collect();
         }
         self.decode(frame).into_iter().collect()
     }
+}
+
+/// The quad spanning every point: top-left is the point with the smallest
+/// `x + y`, top-right the largest `x - y`, and so on round. Used when the
+/// sender tiles several codes, so the monitor shows the whole grid.
+pub fn hull_quad(points: &[(f32, f32)]) -> Option<Quad> {
+    if points.len() < 3 {
+        return None;
+    }
+    let pick = |key: fn(&(f32, f32)) -> f32, largest: bool| {
+        points.iter().copied().fold(points[0], |best, p| {
+            let better = if largest {
+                key(&p) > key(&best)
+            } else {
+                key(&p) < key(&best)
+            };
+            if better {
+                p
+            } else {
+                best
+            }
+        })
+    };
+    let quad = Quad {
+        corners: [
+            pick(|p| p.0 + p.1, false),
+            pick(|p| p.0 - p.1, true),
+            pick(|p| p.0 + p.1, true),
+            pick(|p| p.0 - p.1, false),
+        ],
+    };
+    (quad.area() >= 1.0).then_some(quad)
 }
 
 fn rectified_size(quad: &Quad) -> u32 {
@@ -353,10 +418,8 @@ mod tests {
                 if (0.0..1.0).contains(&u) && (0.0..1.0).contains(&v) {
                     let sx = (u * code.width() as f32) as u32;
                     let sy = (v * code.height() as f32) as u32;
-                    let pixel = *code.get_pixel(
-                        sx.min(code.width() - 1),
-                        sy.min(code.height() - 1),
-                    );
+                    let pixel =
+                        *code.get_pixel(sx.min(code.width() - 1), sy.min(code.height() - 1));
                     canvas.put_pixel(x, y, pixel);
                 }
             }
@@ -467,8 +530,7 @@ mod tests {
     fn corners_are_ordered_clockwise_from_top_left_whatever_order_they_arrive_in() {
         let want = [(10.0, 20.0), (110.0, 15.0), (120.0, 90.0), (5.0, 100.0)];
         for rotation in 0..4 {
-            let shuffled: Vec<(f32, f32)> =
-                (0..4).map(|i| want[(i + rotation) % 4]).collect();
+            let shuffled: Vec<(f32, f32)> = (0..4).map(|i| want[(i + rotation) % 4]).collect();
             assert_eq!(order_quad(&shuffled).unwrap().corners, want);
         }
         // Reversed input must still come back clockwise.
@@ -483,7 +545,12 @@ mod tests {
         let quad = order_quad(&[(100.0, 300.0), (100.0, 100.0), (300.0, 100.0)]).unwrap();
         assert_eq!(
             quad.corners,
-            [(100.0, 100.0), (300.0, 100.0), (300.0, 300.0), (100.0, 300.0)]
+            [
+                (100.0, 100.0),
+                (300.0, 100.0),
+                (300.0, 300.0),
+                (100.0, 300.0)
+            ]
         );
     }
 
@@ -502,7 +569,9 @@ mod tests {
         let canvas = project_onto_canvas(&code, &quad, 1920, 1080);
 
         let mut tracker = Tracker::new();
-        let got = tracker.decode(&canvas).expect("should decode the tilted code");
+        let got = tracker
+            .decode(&canvas)
+            .expect("should decode the tilted code");
         assert_eq!(got, qr::decode_image(&code).unwrap());
         assert!(tracker.locked(), "a successful decode must leave a lock");
 
@@ -535,5 +604,58 @@ mod tests {
         // And it re-acquires once the code is back.
         assert!(tracker.decode(&canvas).is_some());
         assert!(tracker.locked());
+    }
+
+    #[test]
+    fn the_hull_of_several_codes_spans_all_of_them() {
+        let left = [
+            (100.0, 100.0),
+            (200.0, 100.0),
+            (200.0, 200.0),
+            (100.0, 200.0),
+        ];
+        let right = [
+            (400.0, 110.0),
+            (500.0, 110.0),
+            (500.0, 210.0),
+            (400.0, 210.0),
+        ];
+        let quad = hull_quad(&[left, right].concat()).unwrap();
+        assert_eq!(
+            quad.corners,
+            [
+                (100.0, 100.0),
+                (500.0, 110.0),
+                (500.0, 210.0),
+                (100.0, 200.0)
+            ]
+        );
+    }
+
+    #[test]
+    fn points_on_a_line_have_no_hull() {
+        assert!(hull_quad(&[(0.0, 0.0), (1.0, 1.0), (2.0, 2.0), (3.0, 3.0)]).is_none());
+        assert!(hull_quad(&[(0.0, 0.0), (1.0, 1.0)]).is_none());
+    }
+
+    #[test]
+    fn the_tracker_remembers_where_it_last_read_the_peer() {
+        let code = qr::encode_version(b"AX-region", 10).unwrap();
+        let quad = keystone(500.0, 0.2);
+        let canvas = project_onto_canvas(&code, &quad, 1920, 1080);
+        let blank = GrayImage::from_pixel(1920, 1080, Luma([190]));
+        let mut tracker = Tracker::new();
+        assert!(tracker.region().is_none());
+        tracker.decode(&canvas).unwrap();
+        let region = tracker.region().expect("a decode leaves a region");
+        for _ in 0..MAX_MISSES {
+            tracker.decode(&blank);
+        }
+        assert!(!tracker.locked());
+        assert_eq!(
+            tracker.region(),
+            Some(region),
+            "the last place is kept for the monitor"
+        );
     }
 }

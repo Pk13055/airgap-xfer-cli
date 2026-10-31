@@ -8,7 +8,7 @@ use image::GrayImage;
 use ratatui::layout::Rect;
 
 use crate::{
-    frame::Payload,
+    frame::{Payload, PROTOCOL_VERSION},
     live::{check_interrupted, encode_version_for, is_interrupted},
     optical::Optical,
     qr,
@@ -225,7 +225,11 @@ impl Optical for TuiOptical {
     fn set_version(&mut self, version: u8) {
         self.version = version;
         self.linked = true;
-        self.camera.set_multi(true);
+        self.camera.set_linked(true);
+        // Only the receiver watches a peer that tiles DATA. The sender watches
+        // one progress code, which tracked single-code decoding reads far
+        // more cheaply than a full-frame multi-code scan every frame.
+        self.camera.set_multi(self.tiles == Tiles::One);
     }
 
     fn log(&mut self, line: &str) {
@@ -303,6 +307,12 @@ impl Optical for TuiOptical {
             check_interrupted()?;
             if let Some(err) = self.camera.failure() {
                 return Err(Error::Camera(err));
+            }
+            if let Some(peer) = self.camera.foreign_version() {
+                return Err(Error::ProtocolMismatch {
+                    peer,
+                    ours: PROTOCOL_VERSION,
+                });
             }
             if let Some(payload) = self.camera.take_next() {
                 return Ok(Some(payload));
