@@ -3,7 +3,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use crate::{
-    chunks, frame, live,
+    chunks, deliver, live,
     optical::Optical,
     pack,
     resume::{self, Offer},
@@ -164,53 +164,23 @@ fn recv(
         move |mut opt, max_version| {
             let (done, blob) = session::recv_with_fallback(&mut opt, &outdir, force, max_version)?;
             let offer = done.session.offer.clone();
-
-            // recv_blob only verifies the hash; it deliberately does not send OK.
-            // The sender must not see OK until the blob is durably written (and
-            // unpacked) here, so write+unpack happens before we show OK/FAIL.
             let archive_name = pack::archive_filename(&offer.basename);
             let archive_path = outdir.join(&archive_name);
             if !keep_temp {
                 live::set_temp_path(Some(archive_path.clone()));
             }
 
-            opt.log(&format!("writing {archive_name}"));
-            let write_and_unpack = (|| -> crate::Result<()> {
-                if let Some(parent) = archive_path.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                fs::write(&archive_path, &blob)?;
-                // The `.tar.zst` is the received file. Unpack is a convenience;
-                // if it fails the archive stays so the operator can run
-                // `tar --zstd -xf {archive_name}` themselves.
-                pack::unpack(&archive_path, &outdir, force)?;
-                Ok(())
-            })();
-
-            match &write_and_unpack {
-                Ok(()) => {
-                    opt.show(&frame::Payload::Ok {
-                        transfer_id: offer.transfer_id,
-                    })?;
-                }
-                Err(crate::Error::Io(io_err))
-                    if io_err.kind() == std::io::ErrorKind::StorageFull =>
-                {
-                    opt.show(&frame::Payload::Fail {
-                        transfer_id: offer.transfer_id,
-                        reason: frame::FAIL_DISK,
-                    })?;
-                }
-                Err(_) => {
-                    opt.show(&frame::Payload::Fail {
-                        transfer_id: offer.transfer_id,
-                        reason: frame::FAIL_PROTOCOL,
-                    })?;
-                }
-            }
-
+            opt.log(&format!(
+                "verified {archive_name}; writing, syncing and unpacking before telling the sender"
+            ));
+            let mut sink = deliver::DiskSink {
+                archive_path,
+                outdir: outdir.clone(),
+                force,
+            };
+            let delivered = deliver::deliver(&mut opt, &offer, &blob, &mut sink);
             live::set_temp_path(None);
-            write_and_unpack?;
+            delivered?;
             Ok(format!(
                 "received {archive_name} into {} (unpacked {}){}",
                 outdir.display(),

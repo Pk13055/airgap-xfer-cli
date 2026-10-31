@@ -1,4 +1,5 @@
 pub mod cli;
+pub mod deliver;
 pub mod chunks;
 pub mod detect;
 pub mod error;
