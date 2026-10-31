@@ -69,7 +69,7 @@ Guards:
 cargo run --release --example decoder_bench
 ```
 
-Measured on Pk-MBA.local, Darwin 25.2.0 (arm64, T8122), on 2026-11-01:
+Measured on Apple arm64 (T8122), macOS 26.2 (Darwin 25.2.0), on 2026-11-01:
 
 ```
 15 iterations per row, 1920x1080 synthetic frames
@@ -85,7 +85,7 @@ v40 tracked crop                               4.52       7.47    11/15
 v40 monitor crop (96 px)                       0.06       0.06    15/15
 4 x v15 tiles, decode_all                     34.76      35.25    15/15
 
-Note: `v40 tracked crop` decoded only 11/15 iterations on this synthetic frame, so its timing mixes failed and successful decodes.
+Note: `v40 tracked crop` decoded only 11/15 iterations on this synthetic frame, so its timing mixes failed and successful decodes. The cause of these misses is undiagnosed; if it reproduces in real use, expect the tracked path to drop its lock after two consecutive misses (`MAX_MISSES` in `src/detect.rs`) and fall back to slower full-frame scans, with the missed frames returning no data.
 ```
 
 Run it on both laptops and compare. If the monitor goes STALE during steady
@@ -99,9 +99,9 @@ the bottleneck.
 | Check | Command | Result |
 |---|---|---|
 | Release build | `cargo build --release` | pass |
-| Test suite | `cargo test` | 144 passed, 0 failed |
-| Single-threaded | `cargo test -- --test-threads=1` | 144 passed, 0 failed |
-| Repeat run (protocol) | `cargo test -- session:: transport::` ×5 | 5/5 green (24 tests each; the `cargo test session:: transport::` form in the plan is rejected by cargo, so the filters were passed after `--`) |
+| Test suite | `cargo test` | 146 passed, 0 failed |
+| Single-threaded | `cargo test -- --test-threads=1` | 146 passed, 0 failed |
+| Repeat run (protocol) | `cargo test -- session:: transport::` ×5 | 5/5 green (26 tests each; the `cargo test session:: transport::` form in the plan is rejected by cargo, so the filters were passed after `--`) |
 | Formatting (changed files) | `rustfmt --edition 2021 --check …` | clean |
 | Formatting (whole crate) | `cargo fmt --check` | drift in `src/lib.rs` and `src/pack.rs` only (pre-existing) |
 | Lint | `cargo clippy --all-targets` | 2 pre-existing warnings: `warning: field assignment outside of initializer for an instance created with Default::default()` (`src/qr.rs:196:5`); `warning: you seem to be trying to use `match` for destructuring a single pattern. Consider using `if let`` (`src/link.rs:408:9`) |

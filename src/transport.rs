@@ -62,14 +62,12 @@ fn burst_quiet(cfg: TransportConfig, dwell_ms: u16) -> Duration {
     }
 }
 
-/// Live transfers never treat "no DATA yet" as a stall: the sender may still
-/// be painting GO. Fast tests keep a bound so a silent peer cannot hang them.
+/// Upper bound on waiting for the first DATA chunk, in both modes. The
+/// receiver only enters `recv_blob` after reading GO, so the sender is already
+/// sending; an unbounded wait would mean a receiver that never decodes the
+/// first DATA never stalls and the fallback ladder never runs.
 fn first_data_budget(cfg: TransportConfig) -> Option<Duration> {
-    if cfg.fast {
-        Some(ack_timeout(cfg) * STALL_LIMIT)
-    } else {
-        None
-    }
+    Some(ack_timeout(cfg) * STALL_LIMIT)
 }
 
 /// How long the sender waits for OK after FIN. The receiver writes, syncs
@@ -442,6 +440,14 @@ mod tests {
         sync::{Arc, Mutex},
         thread,
     };
+
+    #[test]
+    fn first_data_wait_is_bounded_in_both_modes() {
+        let live = first_data_budget(TransportConfig::default()).expect("live mode is bounded");
+        assert!(live >= Duration::from_secs(60), "live budget {live:?}");
+        let fast = first_data_budget(TransportConfig::fast()).expect("fast mode is bounded");
+        assert!(fast <= Duration::from_secs(5), "fast budget {fast:?}");
+    }
 
     fn offer_for(blob: &[u8]) -> Offer {
         Offer::new(
