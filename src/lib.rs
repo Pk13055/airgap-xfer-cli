@@ -5,6 +5,7 @@ pub mod error;
 pub mod frame;
 pub mod pack;
 pub mod qr;
+pub mod resume;
 pub mod session;
 pub mod optical;
 pub mod link;
