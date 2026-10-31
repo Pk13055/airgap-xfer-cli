@@ -3,7 +3,7 @@ use crate::{
     Error, Result,
 };
 use std::{
-    collections::HashSet,
+    collections::{HashSet, VecDeque},
     sync::mpsc::{self, Receiver, Sender},
     time::Duration,
 };
@@ -138,6 +138,85 @@ impl<T: Optical> Optical for Lossy<T> {
     }
 }
 
+/// Hands back payloads one protocol layer read but the next one must see.
+///
+/// The transport stops as soon as it sees the peer restart the handshake,
+/// and the frame that told it so — a HELLO, PROBE or LINK — is still the one
+/// on the peer's screen. A live camera reports an unchanged code only once,
+/// so if that read were dropped the next handshake would wait for a HELLO
+/// that never arrives "again".
+pub struct Replay<'a, T> {
+    inner: &'a mut T,
+    pending: VecDeque<Payload>,
+}
+
+impl<'a, T: Optical> Replay<'a, T> {
+    pub fn new(inner: &'a mut T) -> Self {
+        Self {
+            inner,
+            pending: VecDeque::new(),
+        }
+    }
+
+    /// Queues `payload` to be the next thing [`Optical::poll`] returns.
+    pub fn push_back(&mut self, payload: Payload) {
+        self.pending.push_back(payload);
+    }
+
+    pub fn pending(&self) -> usize {
+        self.pending.len()
+    }
+}
+
+impl<T: Optical> Optical for Replay<'_, T> {
+    fn show(&mut self, payload: &Payload) -> Result<()> {
+        self.inner.show(payload)
+    }
+
+    fn poll(&mut self, timeout: Duration) -> Result<Option<Payload>> {
+        match self.pending.pop_front() {
+            Some(payload) => Ok(Some(payload)),
+            None => self.inner.poll(timeout),
+        }
+    }
+
+    fn set_status(&mut self, status: &str) {
+        self.inner.set_status(status)
+    }
+
+    fn set_version(&mut self, version: u8) {
+        self.inner.set_version(version)
+    }
+
+    fn log(&mut self, line: &str) {
+        self.inner.log(line)
+    }
+
+    fn suggested_dwell_ms(&mut self) -> u16 {
+        self.inner.suggested_dwell_ms()
+    }
+
+    fn gate(&mut self, prompt: &str) -> Result<bool> {
+        self.inner.gate(prompt)
+    }
+
+    fn gate_locked(&mut self, prompt: &str) -> Result<bool> {
+        self.inner.gate_locked(prompt)
+    }
+
+    fn wait_locked(&mut self, prompt: &str) -> Result<bool> {
+        self.inner.wait_locked(prompt)
+    }
+
+    fn tile_count(&self) -> usize {
+        self.inner.tile_count()
+    }
+
+    fn show_many(&mut self, payloads: &[Payload]) -> Result<()> {
+        self.inner.show_many(payloads)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,5 +263,25 @@ mod tests {
             Some(Payload::Data { first, .. }) => assert_eq!(first, 4),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn replay_hands_back_what_was_pushed_before_anything_new() {
+        let (mut a, mut b) = pair();
+        b.show(&Payload::Ok { transfer_id: 2 }).unwrap();
+        let mut replay = Replay::new(&mut a);
+        replay.push_back(Payload::Hello {
+            protocol_ver: crate::frame::PROTOCOL_VERSION,
+            role: 2,
+        });
+        assert_eq!(replay.pending(), 1);
+        assert!(matches!(
+            replay.poll(Duration::from_millis(1)).unwrap(),
+            Some(Payload::Hello { .. })
+        ));
+        assert_eq!(
+            replay.poll(Duration::from_millis(1)).unwrap(),
+            Some(Payload::Ok { transfer_id: 2 })
+        );
     }
 }
