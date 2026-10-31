@@ -1,8 +1,5 @@
 use std::{
-    sync::{
-        mpsc::Sender,
-        Arc,
-    },
+    sync::{mpsc::Sender, Arc},
     thread,
     time::{Duration, Instant},
 };
@@ -14,6 +11,7 @@ use crate::{
     live::{check_interrupted, encode_version_for, is_interrupted},
     optical::Optical,
     qr,
+    resume::UNSCOPED,
     tui::camera::CameraFeed,
     Error, Result,
 };
@@ -64,7 +62,9 @@ pub enum UiEvent {
         auto_on_lock: bool,
     },
     /// The protocol finished; `summary` is the line to leave on screen.
-    Finished { summary: String },
+    Finished {
+        summary: String,
+    },
 }
 
 /// The [`Optical`] channel the protocol runs against when driven by the TUI:
@@ -91,9 +91,7 @@ impl TuiOptical {
     }
 
     fn send(&self, event: UiEvent) -> Result<()> {
-        self.events
-            .send(event)
-            .map_err(|_| display_closed())
+        self.events.send(event).map_err(|_| display_closed())
     }
 
     fn gate_inner(&mut self, prompt: &str, require_lock: bool, auto_on_lock: bool) -> Result<bool> {
@@ -170,12 +168,18 @@ pub fn payload_label(payload: &Payload) -> String {
         Payload::Hello { .. } => "HELLO".into(),
         Payload::Probe { id, qr_version, .. } => format!("PROBE {id} (v{qr_version})"),
         Payload::Link { qr_version, .. } => format!("LINK (v{qr_version})"),
-        Payload::Go { basename, .. } => format!("GO {basename}"),
-        Payload::Ack { window_base, .. } => format!("ACK @{window_base}"),
-        Payload::Data { seq, .. } => format!("DATA #{seq}"),
+        Payload::Go(offer) => format!("GO {}", offer.basename),
+        Payload::Progress { contiguous, .. } => format!("PROGRESS @{contiguous}"),
+        Payload::Data { first, count, .. } if *count > 1 => {
+            format!(
+                "DATA #{first}-#{}",
+                first.saturating_add(u32::from(*count) - 1)
+            )
+        }
+        Payload::Data { first, .. } => format!("DATA #{first}"),
         Payload::Fin { .. } => "FIN".into(),
-        Payload::Ok => "OK".into(),
-        Payload::Fail { reason } => format!("FAIL {reason}"),
+        Payload::Ok { .. } => "OK".into(),
+        Payload::Fail { reason, .. } => format!("FAIL {reason}"),
     }
 }
 
@@ -186,6 +190,7 @@ impl Optical for TuiOptical {
             Err(err) => {
                 if !matches!(payload, Payload::Fail { .. }) {
                     let _ = self.paint(&Payload::Fail {
+                        transfer_id: UNSCOPED,
                         reason: crate::frame::FAIL_PROTOCOL,
                     });
                 }
@@ -212,8 +217,8 @@ impl Optical for TuiOptical {
         let Some(gap) = self.camera.decode_gap_ms() else {
             return 0;
         };
-        (gap * DECODE_ATTEMPTS_PER_CODE)
-            .clamp(MIN_SUGGESTED_DWELL_MS, MAX_SUGGESTED_DWELL_MS) as u16
+        (gap * DECODE_ATTEMPTS_PER_CODE).clamp(MIN_SUGGESTED_DWELL_MS, MAX_SUGGESTED_DWELL_MS)
+            as u16
     }
 
     fn gate(&mut self, prompt: &str) -> Result<bool> {
@@ -263,6 +268,7 @@ impl Optical for TuiOptical {
             Ok(()) => Ok(()),
             Err(err) => {
                 let _ = self.paint(&Payload::Fail {
+                    transfer_id: UNSCOPED,
                     reason: crate::frame::FAIL_PROTOCOL,
                 });
                 Err(err)
@@ -295,7 +301,7 @@ mod tests {
 
     #[test]
     fn labels_name_the_frame_kind() {
-        assert_eq!(payload_label(&Payload::Ok), "OK");
+        assert_eq!(payload_label(&Payload::Ok { transfer_id: 1 }), "OK");
         assert_eq!(
             payload_label(&Payload::Probe {
                 id: 2,
@@ -305,12 +311,13 @@ mod tests {
             }),
             "PROBE 2 (v20)"
         );
-        assert_eq!(
-            payload_label(&Payload::Data {
-                seq: 7,
-                chunk: vec![]
-            }),
-            "DATA #7"
-        );
+        let data = |count| Payload::Data {
+            transfer_id: 1,
+            first: 7,
+            count,
+            bytes: vec![],
+        };
+        assert_eq!(payload_label(&data(1)), "DATA #7");
+        assert_eq!(payload_label(&data(3)), "DATA #7-#9");
     }
 }

@@ -118,7 +118,8 @@ impl Optical for PairEnd {
 
 pub struct Lossy<T> {
     pub inner: T,
-    pub drop_data_seq: HashSet<u32>,
+    /// DATA spans to lose once each, by first chunk.
+    pub drop_first: HashSet<u32>,
 }
 
 impl<T: Optical> Optical for Lossy<T> {
@@ -128,8 +129,8 @@ impl<T: Optical> Optical for Lossy<T> {
 
     fn poll(&mut self, timeout: Duration) -> Result<Option<Payload>> {
         let payload = self.inner.poll(timeout)?;
-        if let Some(Payload::Data { seq, .. }) = payload.as_ref() {
-            if self.drop_data_seq.remove(seq) {
+        if let Some(Payload::Data { first, .. }) = payload.as_ref() {
+            if self.drop_first.remove(first) {
                 return Ok(None);
             }
         }
@@ -147,7 +148,7 @@ mod tests {
     fn pair_delivers_hello() {
         let (mut a, mut b) = pair();
         a.show(&Payload::Hello {
-            protocol_ver: 1,
+            protocol_ver: crate::frame::PROTOCOL_VERSION,
             role: 2,
         })
         .unwrap();
@@ -158,25 +159,29 @@ mod tests {
     }
 
     #[test]
-    fn lossy_drops_configured_data_seq() {
+    fn lossy_drops_configured_span() {
         let (mut send, recv) = pair();
         let mut recv = Lossy {
             inner: recv,
-            drop_data_seq: [3].into_iter().collect(),
+            drop_first: [3].into_iter().collect(),
         };
         send.show(&Payload::Data {
-            seq: 3,
-            chunk: vec![1],
+            transfer_id: 1,
+            first: 3,
+            count: 1,
+            bytes: vec![1],
         })
         .unwrap();
         assert!(recv.poll(Duration::from_millis(1)).unwrap().is_none());
         send.show(&Payload::Data {
-            seq: 4,
-            chunk: vec![2],
+            transfer_id: 1,
+            first: 4,
+            count: 1,
+            bytes: vec![2],
         })
         .unwrap();
         match recv.poll(Duration::from_millis(1)).unwrap() {
-            Some(Payload::Data { seq, .. }) => assert_eq!(seq, 4),
+            Some(Payload::Data { first, .. }) => assert_eq!(first, 4),
             other => panic!("{other:?}"),
         }
     }

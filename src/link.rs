@@ -6,9 +6,15 @@ use std::{
 };
 
 use crate::{
-    frame::{data_chunk_size, qr_byte_capacity, Payload, FAIL_ABORTED, ROLE_RECV},
+    chunks::ChunkSet,
+    frame::{
+        chunks_per_frame, fail_error, progress_windows, qr_byte_capacity, Payload, FAIL_ABORTED,
+        FAIL_DISK, FAIL_PROTOCOL, PROTOCOL_VERSION, ROLE_RECV,
+    },
     optical::Optical,
     pack::dest_exists,
+    resume::{Offer, ReceiveCache, Reuse, UNSCOPED},
+    transport::progress_payload,
     Error, Result,
 };
 
@@ -145,26 +151,35 @@ pub fn is_retryable(err: &Error) -> bool {
             | Error::NoUsableProbe
             | Error::BadFrame
             | Error::HashMismatch
+            | Error::Restart(_)
     )
 }
 
+/// What both sides agreed on for one attempt.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Session {
     pub qr_version: u8,
     pub dwell_ms: u16,
-    pub basename: String,
-    pub uncompressed_hint: u64,
-    pub compressed_size: u64,
-    pub chunk_count: u32,
-    pub sha256: [u8; 32],
+    pub offer: Offer,
+}
+
+/// The sender's side of a completed handshake: the session, plus what the
+/// receiver reported it already holds.
+#[derive(Clone, Debug)]
+pub struct Linked {
+    pub session: Session,
+    pub acked: ChunkSet,
 }
 
 fn hello_timeout(cfg: LinkConfig) -> Duration {
     // `fast` is the test knob and wins: patient timeouts are minutes long
     // because a human (or a peer working through its own retry) is in the
-    // loop, which no test wants to wait for.
+    // loop, which no test wants to wait for. It is still a full second: long
+    // enough to outlast the peer's fast-mode stall detection (20 rounds of
+    // 50 ms), so a test peer that is still giving up on its previous attempt
+    // is waited for rather than counted as another failure.
     if cfg.fast {
-        Duration::from_millis(100)
+        Duration::from_secs(1)
     } else if cfg.patient {
         GATED_TIMEOUT
     } else {
@@ -221,14 +236,18 @@ fn poll_until<T>(
     }
 }
 
+fn offer_prompt(offer: &Offer, qr_version: u8) -> String {
+    format!(
+        "Linked at QR v{qr_version}. Send {} ({} B, {} chunks)? Enter sends, Esc aborts. The receiver accepts on its own",
+        offer.basename, offer.compressed_size, offer.chunk_count
+    )
+}
+
 pub fn run_send_handshake(
     opt: &mut impl Optical,
-    basename: String,
-    uncompressed_hint: u64,
-    blob: &[u8],
-    sha256: [u8; 32],
+    offer: &Offer,
     cfg: LinkConfig,
-) -> Result<Session> {
+) -> Result<Linked> {
     let hello = poll_until(opt, hello_timeout(cfg), |payload| match payload {
         Payload::Hello { .. } => Some(()),
         _ => None,
@@ -273,7 +292,6 @@ pub fn run_send_handshake(
         return Err(Error::HandshakeFailed);
     };
     let dwell_ms = linked_dwell_ms.max(cfg.dwell_floor_ms);
-
     if qr_version > cfg.max_qr_version {
         return Err(Error::NoUsableProbe);
     }
@@ -281,60 +299,68 @@ pub fn run_send_handshake(
     // Lock the QR version before GO is shown so GO (and everything after
     // it) is encoded at the negotiated version instead of the probe default.
     opt.set_version(qr_version);
-    opt.log(&format!(
-        "linked at QR v{qr_version}, {dwell_ms} ms dwell"
-    ));
+    opt.log(&format!("linked at QR v{qr_version}, {dwell_ms} ms dwell"));
 
-    let chunk_size = data_chunk_size(qr_version);
-    if chunk_size == 0 {
+    if chunks_per_frame(qr_version) == 0 {
         return Err(Error::HandshakeFailed);
     }
     crate::qr::ensure_full_data_frame_fits(qr_version)?;
-    let chunk_count = blob.len().div_ceil(chunk_size).max(1) as u32;
-    let compressed_size = blob.len() as u64;
-    let go = Payload::Go {
-        basename: basename.clone(),
-        uncompressed_hint,
-        compressed_size,
-        chunk_count,
-        sha256,
-    };
+    let go = Payload::Go(offer.clone());
     let go_len = crate::frame::encode(&go)?.len();
     let cap = qr_byte_capacity(qr_version);
     if go_len > cap {
         return Err(Error::Message(format!(
-            "filename {basename:?} makes the offer {go_len} bytes; QR v{qr_version} holds {cap}"
+            "filename {:?} makes the offer {go_len} bytes; QR v{qr_version} holds {cap}",
+            offer.basename
         )));
     }
-    // Confirm here, not after the receiver has already accepted: that left
-    // the receiver in the DATA loop (and stall detection) while this side
-    // still waited for Enter.
-    if cfg.confirm_offer
-        && !opt.gate(&format!(
-            "Ready to send {basename} in {chunk_count} chunks. Enter to start the transfer"
-        ))?
-    {
+    // Confirm here, not after the receiver has already accepted: the
+    // receiver is still waiting for the offer, not timing DATA.
+    if cfg.confirm_offer && !opt.gate(&offer_prompt(offer, qr_version))? {
         return Err(Error::Aborted);
     }
     opt.show(&go)?;
 
-    let ack = poll_until(opt, go_timeout(cfg), |payload| match payload {
-        Payload::Ack { window_base: 0, .. } => Some(()),
+    // Acceptance is a progress report: empty for a new offer, or everything
+    // already held when the receiver is resuming this exact offer.
+    let reply = poll_until(opt, go_timeout(cfg), |payload| match payload {
+        Payload::Progress {
+            transfer_id,
+            contiguous,
+            bitmaps,
+            ..
+        } if transfer_id == offer.transfer_id => Some(Ok((contiguous, bitmaps))),
+        Payload::Fail {
+            transfer_id,
+            reason,
+        } if transfer_id == offer.transfer_id || transfer_id == UNSCOPED => {
+            Some(Err(fail_error(reason)))
+        }
         _ => None,
     })?;
-    if ack.is_none() {
+    let Some(reply) = reply else {
         return Err(Error::HandshakeFailed);
+    };
+    let (contiguous, bitmaps) = reply?;
+    let acked = ChunkSet::from_report(offer.chunk_count, contiguous, &bitmaps)
+        .ok_or(Error::HandshakeFailed)?;
+    if acked.count() == 0 {
+        opt.log("receiver accepted the offer");
+    } else {
+        opt.log(&format!(
+            "receiver already holds {}/{} chunks; resuming",
+            acked.count(),
+            offer.chunk_count
+        ));
     }
-    opt.log("receiver accepted the offer");
 
-    Ok(Session {
-        qr_version,
-        dwell_ms,
-        basename,
-        uncompressed_hint,
-        compressed_size,
-        chunk_count,
-        sha256,
+    Ok(Linked {
+        session: Session {
+            qr_version,
+            dwell_ms,
+            offer: offer.clone(),
+        },
+        acked,
     })
 }
 
@@ -356,6 +382,7 @@ pub fn run_recv_handshake(
     outdir: &Path,
     force: bool,
     cfg: LinkConfig,
+    cache: &mut ReceiveCache,
 ) -> Result<Session> {
     let hello_deadline = Instant::now() + hello_timeout(cfg);
     let mut probes = Vec::new();
@@ -373,7 +400,7 @@ pub fn run_recv_handshake(
         };
 
         opt.show(&Payload::Hello {
-            protocol_ver: 1,
+            protocol_ver: PROTOCOL_VERSION,
             role: ROLE_RECV,
         })?;
 
@@ -428,8 +455,7 @@ pub fn run_recv_handshake(
     }
 
     probes.retain(|(id, qr_version, _)| {
-        *qr_version <= cfg.max_qr_version
-            && PROBES.iter().any(|(probe_id, _, _)| id == probe_id)
+        *qr_version <= cfg.max_qr_version && PROBES.iter().any(|(probe_id, _, _)| id == probe_id)
     });
     let successful_count = probes
         .iter()
@@ -470,51 +496,67 @@ pub fn run_recv_handshake(
         probe_loss,
     })?;
 
-    let Some((basename, uncompressed_hint, compressed_size, chunk_count, sha256)) =
-        poll_until(opt, go_timeout(cfg), |payload| match payload {
-            Payload::Go {
-                basename,
-                uncompressed_hint,
-                compressed_size,
-                chunk_count,
-                sha256,
-            } => Some((
-                basename,
-                uncompressed_hint,
-                compressed_size,
-                chunk_count,
-                sha256,
-            )),
-            _ => None,
-        })?
+    let Some(offer) = poll_until(opt, go_timeout(cfg), |payload| match payload {
+        Payload::Go(offer) => Some(offer),
+        _ => None,
+    })?
     else {
         return Err(Error::HandshakeFailed);
     };
 
-    if dest_exists(outdir, &basename) && !force {
+    if !offer.is_consistent() {
+        opt.log("refusing an offer whose transfer id does not match its contents");
         opt.show(&Payload::Fail {
+            transfer_id: offer.transfer_id,
+            reason: FAIL_PROTOCOL,
+        })?;
+        return Err(Error::HandshakeFailed);
+    }
+    if dest_exists(outdir, &offer.basename) && !force {
+        opt.show(&Payload::Fail {
+            transfer_id: offer.transfer_id,
             reason: FAIL_ABORTED,
         })?;
-        return Err(Error::DestExists(outdir.join(basename)));
+        return Err(Error::DestExists(outdir.join(&offer.basename)));
     }
+    let Some(reuse) = cache.adopt(&offer) else {
+        opt.show(&Payload::Fail {
+            transfer_id: offer.transfer_id,
+            reason: FAIL_DISK,
+        })?;
+        return Err(Error::Message(format!(
+            "{} B is too large to receive on this machine",
+            offer.compressed_size
+        )));
+    };
+    opt.log(&match reuse {
+        Reuse::Fresh => format!(
+            "offer: {}, {} B compressed, {} chunks",
+            offer.basename, offer.compressed_size, offer.chunk_count
+        ),
+        Reuse::Resumed { held } => format!(
+            "offer matches the interrupted transfer: resuming with {held}/{} chunks",
+            offer.chunk_count
+        ),
+        Reuse::Replaced { dropped } => format!(
+            "offer: {} replaces an interrupted transfer ({dropped} chunks discarded)",
+            offer.basename
+        ),
+    });
 
-    opt.log(&format!(
-        "offer: {basename}, {compressed_size} B compressed, {chunk_count} chunks"
-    ));
-
-    opt.show(&Payload::Ack {
-        window_base: 0,
-        bitmap: 0,
-    })?;
+    let store = cache.store(&offer).ok_or(Error::HandshakeFailed)?;
+    // Accepting is reporting progress, so a resumed sender skips what is
+    // already here.
+    opt.show(&progress_payload(
+        &offer,
+        store,
+        progress_windows(qr_version),
+    ))?;
 
     Ok(Session {
         qr_version,
         dwell_ms,
-        basename,
-        uncompressed_hint,
-        compressed_size,
-        chunk_count,
-        sha256,
+        offer,
     })
 }
 
@@ -522,6 +564,8 @@ pub fn run_recv_handshake(
 mod tests {
     use super::*;
     use crate::optical::{pair, Optical};
+    use crate::resume::{Offer, ReceiveCache};
+    use std::path::Path;
     use std::sync::{Arc, Mutex};
     use std::thread;
 
@@ -547,13 +591,7 @@ mod tests {
                     dwell_ms: 250,
                     last: true,
                 })),
-                _ if self.link_shown => Ok(Some(Payload::Go {
-                    basename: "file".into(),
-                    uncompressed_hint: 0,
-                    compressed_size: 1,
-                    chunk_count: 1,
-                    sha256: [0; 32],
-                })),
+                _ if self.link_shown => Ok(Some(Payload::Go(test_offer(1)))),
                 _ => {
                     thread::sleep(timeout);
                     Ok(None)
@@ -611,6 +649,37 @@ mod tests {
         out
     }
 
+    fn test_offer(size: u64) -> Offer {
+        Offer::new("dir", 10, size, [7; 32], 1).unwrap()
+    }
+
+    fn fresh_recv(opt: &mut impl Optical, out: &Path, cfg: LinkConfig) -> Result<Session> {
+        run_recv_handshake(opt, out, false, cfg, &mut ReceiveCache::default())
+    }
+
+    /// Replays a fixed script of payloads, then goes quiet.
+    struct ScriptedPeer {
+        script: std::collections::VecDeque<Payload>,
+        shown: Vec<Payload>,
+    }
+
+    impl Optical for ScriptedPeer {
+        fn show(&mut self, payload: &Payload) -> Result<()> {
+            self.shown.push(payload.clone());
+            Ok(())
+        }
+
+        fn poll(&mut self, timeout: Duration) -> Result<Option<Payload>> {
+            match self.script.pop_front() {
+                Some(payload) => Ok(Some(payload)),
+                None => {
+                    thread::sleep(timeout);
+                    Ok(None)
+                }
+            }
+        }
+    }
+
     /// A receiver whose camera is slow enough that the probe table's dwell
     /// would give each code only one look.
     struct SlowCamera<T> {
@@ -646,10 +715,11 @@ mod tests {
         let cfg = LinkConfig::fast();
 
         let send_t = thread::spawn(move || {
-            run_send_handshake(&mut send_opt, "dir".into(), 10, &[1u8, 2, 3], [7; 32], cfg).unwrap()
+            run_send_handshake(&mut send_opt, &test_offer(3), cfg)
+                .map(|linked| linked.session)
+                .unwrap()
         });
-        let recv_session =
-            run_recv_handshake(&mut recv_opt, &scratch_dir("dwell"), false, cfg).unwrap();
+        let recv_session = fresh_recv(&mut recv_opt, &scratch_dir("dwell"), cfg).unwrap();
         let send_session = send_t.join().unwrap();
 
         // The probe table would have said 150 ms for v40.
@@ -674,10 +744,11 @@ mod tests {
         };
 
         let send_t = thread::spawn(move || {
-            run_send_handshake(&mut send_opt, "dir".into(), 10, &[1u8, 2, 3], [7; 32], cfg).unwrap()
+            run_send_handshake(&mut send_opt, &test_offer(3), cfg)
+                .map(|linked| linked.session)
+                .unwrap()
         });
-        let recv_session =
-            run_recv_handshake(&mut recv_opt, &scratch_dir("dwell-floor"), false, cfg).unwrap();
+        let recv_session = fresh_recv(&mut recv_opt, &scratch_dir("dwell-floor"), cfg).unwrap();
         send_t.join().unwrap();
         assert_eq!(recv_session.dwell_ms, 900);
     }
@@ -690,17 +761,20 @@ mod tests {
         let cfg = LinkConfig::fast();
 
         let send_t = thread::spawn(move || {
-            run_send_handshake(&mut send_opt, "dir".into(), 10, &[1u8, 2, 3], [7; 32], cfg).unwrap()
+            run_send_handshake(&mut send_opt, &test_offer(3), cfg)
+                .map(|linked| linked.session)
+                .unwrap()
         });
-        let recv_t = thread::spawn(move || {
-            run_recv_handshake(&mut recv_opt, &scratch_dir("gate-ok"), false, cfg).unwrap()
-        });
+        let recv_t =
+            thread::spawn(move || fresh_recv(&mut recv_opt, &scratch_dir("gate-ok"), cfg).unwrap());
         send_t.join().unwrap();
         recv_t.join().unwrap();
 
         let send_logs = send_logs.lock().unwrap().clone();
         assert!(
-            send_logs.iter().any(|line| line.contains("receiver said HELLO")),
+            send_logs
+                .iter()
+                .any(|line| line.contains("receiver said HELLO")),
             "{send_logs:?}"
         );
         assert!(
@@ -731,20 +805,19 @@ mod tests {
         let (mut recv_opt, recv_logs, _) = gated(recv_end);
 
         let send_t = thread::spawn(move || {
-            run_send_handshake(&mut send_opt, "dir".into(), 10, &[1u8, 2, 3], [7; 32], cfg).unwrap()
+            run_send_handshake(&mut send_opt, &test_offer(3), cfg)
+                .map(|linked| linked.session)
+                .unwrap()
         });
-        let recv_session =
-            run_recv_handshake(&mut recv_opt, &scratch_dir("gate-cap"), false, cfg).unwrap();
+        let recv_session = fresh_recv(&mut recv_opt, &scratch_dir("gate-cap"), cfg).unwrap();
         let send_session = send_t.join().unwrap();
 
         assert_eq!(recv_session.qr_version, 15);
         assert_eq!(send_session.qr_version, 15);
         assert!(
-            send_shown
-                .lock()
-                .unwrap()
-                .iter()
-                .all(|payload| !matches!(payload, Payload::Probe { qr_version, .. } if *qr_version > 15)),
+            send_shown.lock().unwrap().iter().all(
+                |payload| !matches!(payload, Payload::Probe { qr_version, .. } if *qr_version > 15)
+            ),
             "probes above the display limit must never be offered"
         );
         // The four probes above v15 were never on the table, so they are not
@@ -786,30 +859,33 @@ mod tests {
         assert_eq!(link_timeout(cfg), GATED_TIMEOUT);
         assert_eq!(go_timeout(cfg), GATED_TIMEOUT);
         // The ungated live path keeps its original, tighter budgets.
-        assert_eq!(hello_timeout(LinkConfig::default()), Duration::from_secs(30));
+        assert_eq!(
+            hello_timeout(LinkConfig::default()),
+            Duration::from_secs(30)
+        );
     }
 
     #[test]
     fn handshake_picks_highest_passing_probe() {
         let (mut send_opt, mut recv_opt) = pair();
         let cfg = LinkConfig::fast();
-        let blob = vec![1u8, 2, 3, 4, 5];
-        let sha256 = [1u8; 32];
         let send_t = thread::spawn(move || {
-            run_send_handshake(&mut send_opt, "dir".into(), 10, &blob, sha256, cfg).unwrap()
+            run_send_handshake(&mut send_opt, &test_offer(5), cfg)
+                .map(|linked| linked.session)
+                .unwrap()
         });
         let recv_t = thread::spawn(move || {
             let out = std::env::temp_dir().join(format!("ag-hs-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&out);
             std::fs::create_dir_all(&out).unwrap();
-            run_recv_handshake(&mut recv_opt, &out, false, cfg).unwrap()
+            fresh_recv(&mut recv_opt, &out, cfg).unwrap()
         });
         let s = send_t.join().unwrap();
         let r = recv_t.join().unwrap();
         assert_eq!(s.qr_version, 40);
         assert_eq!(r.qr_version, 40);
-        assert_eq!(s.basename, "dir");
-        assert_eq!(r.chunk_count, 1);
+        assert_eq!(s.offer.basename, "dir");
+        assert_eq!(r.offer.chunk_count, 1);
     }
 
     #[test]
@@ -820,7 +896,7 @@ mod tests {
         let (_send_end, mut recv_end) = pair();
         let cfg = LinkConfig::fast();
         let out = std::env::temp_dir();
-        let err = run_recv_handshake(&mut recv_end, &out, false, cfg).unwrap_err();
+        let err = fresh_recv(&mut recv_end, &out, cfg).unwrap_err();
         assert!(matches!(err, crate::Error::HandshakeTimeout));
     }
 
@@ -844,6 +920,7 @@ mod tests {
             &std::env::temp_dir(),
             false,
             LinkConfig::fast(),
+            &mut ReceiveCache::default(),
         )
         .unwrap_err();
         assert!(matches!(err, Error::Message(m) if m == "boom"));
@@ -855,7 +932,7 @@ mod tests {
         drop(send_end);
         let cfg = LinkConfig::fast();
         let out = std::env::temp_dir();
-        let err = run_recv_handshake(&mut recv_end, &out, false, cfg).unwrap_err();
+        let err = fresh_recv(&mut recv_end, &out, cfg).unwrap_err();
         assert!(matches!(err, crate::Error::Message(_)));
     }
 
@@ -869,7 +946,7 @@ mod tests {
 
         impl<T: Optical> Optical for GoVersionRecorder<T> {
             fn show(&mut self, payload: &Payload) -> Result<()> {
-                if matches!(payload, Payload::Go { .. }) && self.version_set_before_go.is_none() {
+                if matches!(payload, Payload::Go(_)) && self.version_set_before_go.is_none() {
                     self.version_set_before_go = Some(self.version_set);
                 }
                 self.inner.show(payload)
@@ -891,19 +968,17 @@ mod tests {
             version_set: false,
         };
         let cfg = LinkConfig::fast();
-        let blob = vec![1u8, 2, 3, 4, 5];
-        let sha256 = [1u8; 32];
 
         let send_t = thread::spawn(move || {
             let result =
-                run_send_handshake(&mut send_opt, "dir".into(), 5, &blob, sha256, cfg);
+                run_send_handshake(&mut send_opt, &test_offer(5), cfg).map(|linked| linked.session);
             (result, send_opt.version_set_before_go)
         });
         let recv_t = thread::spawn(move || {
             let out = std::env::temp_dir().join(format!("ag-hs-ver-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&out);
             std::fs::create_dir_all(&out).unwrap();
-            run_recv_handshake(&mut recv_opt, &out, false, cfg).unwrap()
+            fresh_recv(&mut recv_opt, &out, cfg).unwrap()
         });
 
         let (send_result, version_set_before_go) = send_t.join().unwrap();
@@ -945,17 +1020,17 @@ mod tests {
             version_set: false,
         };
         let cfg = LinkConfig::fast();
-        let blob = vec![1u8, 2, 3, 4, 5];
-        let sha256 = [1u8; 32];
 
         let send_t = thread::spawn(move || {
-            run_send_handshake(&mut send_opt, "dir".into(), 5, &blob, sha256, cfg).unwrap()
+            run_send_handshake(&mut send_opt, &test_offer(5), cfg)
+                .map(|linked| linked.session)
+                .unwrap()
         });
         let recv_t = thread::spawn(move || {
             let out = std::env::temp_dir().join(format!("ag-hs-ver2-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&out);
             std::fs::create_dir_all(&out).unwrap();
-            let result = run_recv_handshake(&mut recv_opt, &out, false, cfg);
+            let result = fresh_recv(&mut recv_opt, &out, cfg);
             (result, recv_opt.version_set_before_link)
         });
 
@@ -990,6 +1065,7 @@ mod tests {
             &std::env::temp_dir(),
             false,
             LinkConfig::fast(),
+            &mut ReceiveCache::default(),
         )
         .unwrap_err();
 
@@ -1006,7 +1082,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&out);
         std::fs::create_dir_all(&out).unwrap();
 
-        run_recv_handshake(&mut opt, &out, false, LinkConfig::fast()).unwrap();
+        fresh_recv(&mut opt, &out, LinkConfig::fast()).unwrap();
 
         assert_eq!(opt.poll_count, 2);
     }
@@ -1057,20 +1133,23 @@ mod tests {
         };
 
         let send_t = thread::spawn(move || {
-            run_send_handshake(&mut send_opt, "dir".into(), 10, &[1u8, 2, 3], [7; 32], cfg)
-                .map(|session| (session, send_opt.prompts, send_opt.shown))
+            run_send_handshake(&mut send_opt, &test_offer(3), cfg)
+                .map(|linked| (linked.session, send_opt.prompts, send_opt.shown))
         });
-        run_recv_handshake(&mut recv_opt, &scratch_dir("confirm-go"), false, cfg).unwrap();
+        fresh_recv(&mut recv_opt, &scratch_dir("confirm-go"), cfg).unwrap();
         let (_, prompts, shown) = send_t.join().unwrap().unwrap();
 
         assert_eq!(prompts.len(), 1, "{prompts:?}");
-        assert!(prompts[0].contains("Enter to start the transfer"), "{prompts:?}");
+        assert!(prompts[0].contains("Enter sends"), "{prompts:?}");
         let go_at = shown
             .iter()
-            .position(|payload| matches!(payload, Payload::Go { .. }))
+            .position(|payload| matches!(payload, Payload::Go(_)))
             .expect("GO must be shown after the operator confirms");
         assert!(
-            shown.iter().take(go_at).all(|payload| matches!(payload, Payload::Probe { .. })),
+            shown
+                .iter()
+                .take(go_at)
+                .all(|payload| matches!(payload, Payload::Probe { .. })),
             "only probes should precede GO, got {shown:?}"
         );
     }
@@ -1089,18 +1168,9 @@ mod tests {
             confirm_offer: true,
             ..LinkConfig::default()
         };
-        let recv_t = thread::spawn(move || {
-            run_recv_handshake(&mut recv_end, &scratch_dir("decline-go"), false, cfg)
-        });
-        let err = run_send_handshake(
-            &mut send_opt,
-            "dir".into(),
-            10,
-            &[1u8, 2, 3],
-            [7; 32],
-            cfg,
-        )
-        .unwrap_err();
+        let recv_t =
+            thread::spawn(move || fresh_recv(&mut recv_end, &scratch_dir("decline-go"), cfg));
+        let err = run_send_handshake(&mut send_opt, &test_offer(3), cfg).unwrap_err();
         let _ = recv_t.join();
         assert!(matches!(err, Error::Aborted), "{err:?}");
         assert!(
@@ -1111,5 +1181,111 @@ mod tests {
             "a declined offer must not show GO, got {:?}",
             send_opt.shown
         );
+    }
+
+    fn held_cache(offer: &Offer, chunks: u32) -> ReceiveCache {
+        let mut cache = ReceiveCache::default();
+        cache.adopt(offer).unwrap();
+        let bytes = vec![0u8; chunks as usize * crate::chunks::CHUNK_BYTES];
+        cache
+            .store(offer)
+            .unwrap()
+            .accept(0, chunks, &bytes)
+            .unwrap();
+        cache
+    }
+
+    #[test]
+    fn a_matching_offer_resumes_with_the_chunks_already_held() {
+        let offer = test_offer(500);
+        let mut cache = held_cache(&offer, 2);
+        let (mut send_end, mut recv_end) = pair();
+        let cfg = LinkConfig::fast();
+        let sent = offer.clone();
+        let send_t = thread::spawn(move || run_send_handshake(&mut send_end, &sent, cfg).unwrap());
+        let session = run_recv_handshake(
+            &mut recv_end,
+            &scratch_dir("resume-match"),
+            false,
+            cfg,
+            &mut cache,
+        )
+        .unwrap();
+        let linked = send_t.join().unwrap();
+        assert_eq!(session.offer, offer);
+        assert_eq!(
+            linked.acked.count(),
+            2,
+            "the sender must learn what is already held"
+        );
+        assert!(linked.acked.contains(0) && linked.acked.contains(1));
+        assert_eq!(cache.held(), 2);
+    }
+
+    #[test]
+    fn an_offer_that_differs_in_any_field_starts_from_nothing() {
+        let held = test_offer(500);
+        for other in [
+            Offer::new("dir", 10, 500, [8; 32], 1).unwrap(),
+            Offer::new("dir", 10, 500, [7; 32], 2).unwrap(),
+            Offer::new("other", 10, 500, [7; 32], 1).unwrap(),
+            Offer::new("dir", 11, 500, [7; 32], 1).unwrap(),
+        ] {
+            let mut cache = held_cache(&held, 2);
+            let (mut send_end, mut recv_end) = pair();
+            let cfg = LinkConfig::fast();
+            let sent = other.clone();
+            let send_t =
+                thread::spawn(move || run_send_handshake(&mut send_end, &sent, cfg).unwrap());
+            run_recv_handshake(
+                &mut recv_end,
+                &scratch_dir("resume-other"),
+                false,
+                cfg,
+                &mut cache,
+            )
+            .unwrap();
+            let linked = send_t.join().unwrap();
+            assert_eq!(linked.acked.count(), 0, "{other:?} must not inherit chunks");
+            assert_eq!(cache.held(), 0);
+        }
+    }
+
+    #[test]
+    fn an_inconsistent_offer_is_refused_before_touching_the_cache() {
+        let held = test_offer(500);
+        let mut forged = test_offer(500);
+        forged.transfer_id ^= 1;
+        let mut cache = held_cache(&held, 2);
+        let mut peer = ScriptedPeer {
+            script: [
+                Payload::Probe {
+                    id: 0,
+                    qr_version: 10,
+                    dwell_ms: 250,
+                    last: true,
+                },
+                Payload::Go(forged),
+            ]
+            .into(),
+            shown: Vec::new(),
+        };
+        let err = run_recv_handshake(
+            &mut peer,
+            &scratch_dir("forged"),
+            false,
+            LinkConfig::fast(),
+            &mut cache,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::HandshakeFailed), "{err:?}");
+        assert!(peer.shown.iter().any(|p| matches!(
+            p,
+            Payload::Fail {
+                reason: FAIL_PROTOCOL,
+                ..
+            }
+        )));
+        assert_eq!(cache.held(), 2, "the interrupted transfer is untouched");
     }
 }

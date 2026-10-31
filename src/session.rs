@@ -14,8 +14,9 @@
 use std::path::Path;
 
 use crate::{
-    link::{self, Attempt, LinkConfig, Session, MAX_ATTEMPTS},
+    link::{self, Attempt, LinkConfig, Linked, Session, MAX_ATTEMPTS},
     optical::Optical,
+    resume::{Offer, ReceiveCache},
     transport::{self, TransportConfig},
     Error, Result,
 };
@@ -63,32 +64,28 @@ fn note_retry(opt: &mut impl Optical, attempt: usize, next: Attempt, err: &Error
 /// out.
 pub fn send_with_fallback(
     opt: &mut impl Optical,
-    basename: &str,
-    uncompressed_hint: u64,
+    offer: &Offer,
     blob: &[u8],
-    sha256: [u8; 32],
     terminal_max: u8,
 ) -> Result<Completed> {
     let mut last = None;
     for attempt in 0..MAX_ATTEMPTS {
         let (link_cfg, transport_cfg, _) = configs_for(attempt, terminal_max);
-        let outcome = link::run_send_handshake(
-            opt,
-            basename.to_string(),
-            uncompressed_hint,
-            blob,
-            sha256,
-            link_cfg,
-        )
-        .and_then(|session| {
-            transport::send_blob(opt, &session, blob, transport_cfg)?;
-            Ok(session)
-        });
-
+        let outcome = link::run_send_handshake(opt, offer, link_cfg).and_then(
+            |Linked { session, mut acked }| {
+                transport::send_blob(opt, &session, blob, &mut acked, transport_cfg)?;
+                Ok(session)
+            },
+        );
         match outcome {
             Ok(session) => return Ok(Completed { session, attempt }),
             Err(err) if link::is_retryable(&err) && attempt + 1 < MAX_ATTEMPTS => {
-                note_retry(opt, attempt, link::attempt_plan(attempt + 1, terminal_max), &err);
+                note_retry(
+                    opt,
+                    attempt,
+                    link::attempt_plan(attempt + 1, terminal_max),
+                    &err,
+                );
                 last = Some(err);
             }
             Err(err) => return Err(err),
@@ -98,6 +95,7 @@ pub fn send_with_fallback(
 }
 
 /// Receives a blob into `outdir`'s namespace, stepping down the same ladder.
+/// Chunks already assembled survive every retry for an identical offer.
 ///
 /// Returns the blob rather than writing it: the caller owns the durable write
 /// and is the only thing that may tell the sender OK.
@@ -107,18 +105,30 @@ pub fn recv_with_fallback(
     force: bool,
     terminal_max: u8,
 ) -> Result<(Completed, Vec<u8>)> {
+    let mut cache = ReceiveCache::default();
     let mut last = None;
     for attempt in 0..MAX_ATTEMPTS {
         let (link_cfg, transport_cfg, _) = configs_for(attempt, terminal_max);
-        let outcome = link::run_recv_handshake(opt, outdir, force, link_cfg).and_then(|session| {
-            let blob = transport::recv_blob(opt, &session, transport_cfg)?;
-            Ok((session, blob))
-        });
-
+        let outcome = link::run_recv_handshake(opt, outdir, force, link_cfg, &mut cache).and_then(
+            |session| {
+                let store = cache.store(&session.offer).ok_or(Error::HandshakeFailed)?;
+                let blob = transport::recv_blob(opt, &session, store, transport_cfg)?;
+                Ok((session, blob))
+            },
+        );
+        if matches!(outcome, Err(Error::HashMismatch)) {
+            // Some accepted chunk was wrong and there is no telling which.
+            cache.clear();
+        }
         match outcome {
             Ok((session, blob)) => return Ok((Completed { session, attempt }, blob)),
             Err(err) if link::is_retryable(&err) && attempt + 1 < MAX_ATTEMPTS => {
-                note_retry(opt, attempt, link::attempt_plan(attempt + 1, terminal_max), &err);
+                note_retry(
+                    opt,
+                    attempt,
+                    link::attempt_plan(attempt + 1, terminal_max),
+                    &err,
+                );
                 last = Some(err);
             }
             Err(err) => return Err(err),
@@ -132,7 +142,9 @@ mod tests {
     use super::*;
     use crate::{
         frame::Payload,
+        link::Linked,
         optical::{pair, Optical},
+        resume::{Offer, ReceiveCache},
     };
     use sha2::{Digest, Sha256};
     use std::{
@@ -218,6 +230,7 @@ mod tests {
     fn a_link_that_cannot_sustain_big_codes_is_walked_down_until_it_can() {
         let blob: Vec<u8> = (0..1200u32).map(|i| i as u8).collect();
         let sha256: [u8; 32] = Sha256::digest(&blob).into();
+        let offer = Offer::new("dir", blob.len() as u64, blob.len() as u64, sha256, 1).unwrap();
         // Probes pass at every version, but DATA only survives at v15 or less.
         const CEILING: u8 = 15;
 
@@ -238,24 +251,23 @@ mod tests {
         let send_blob = blob.clone();
         let send_t = thread::spawn(move || {
             drive(|_, link_cfg, transport_cfg| {
-                let session = link::run_send_handshake(
-                    &mut sender,
-                    "dir".into(),
-                    send_blob.len() as u64,
-                    &send_blob,
-                    sha256,
-                    link_cfg,
-                )?;
-                transport::send_blob(&mut sender, &session, &send_blob, transport_cfg)?;
+                let Linked { session, mut acked } =
+                    link::run_send_handshake(&mut sender, &offer, link_cfg)?;
+                transport::send_blob(&mut sender, &session, &send_blob, &mut acked, transport_cfg)?;
                 Ok(session)
             })
         });
 
         let out = scratch_dir("ladder");
+        let mut cache = ReceiveCache::default();
         let (received, recv_attempt) = drive(|_, link_cfg, transport_cfg| {
-            let session = link::run_recv_handshake(&mut receiver, &out, false, link_cfg)?;
-            let got = transport::recv_blob(&mut receiver, &session, transport_cfg)?;
-            receiver.show(&Payload::Ok)?;
+            let session =
+                link::run_recv_handshake(&mut receiver, &out, false, link_cfg, &mut cache)?;
+            let store = cache.store(&session.offer).ok_or(Error::HandshakeFailed)?;
+            let got = transport::recv_blob(&mut receiver, &session, store, transport_cfg)?;
+            receiver.show(&Payload::Ok {
+                transfer_id: session.offer.transfer_id,
+            })?;
             Ok((session, got))
         });
 
@@ -294,7 +306,10 @@ mod tests {
                 "the dwell must never shrink between attempts"
             );
         }
-        assert_eq!(plans[MAX_ATTEMPTS - 1].max_qr_version, crate::qr::smallest_version());
+        assert_eq!(
+            plans[MAX_ATTEMPTS - 1].max_qr_version,
+            crate::qr::smallest_version()
+        );
         assert!(plans[MAX_ATTEMPTS - 1].dwell_floor_ms >= 1000);
     }
 
@@ -336,10 +351,7 @@ mod tests {
         );
         for attempt in 1..MAX_ATTEMPTS {
             let (link_cfg, _, _) = configs_for(attempt, 40);
-            assert!(
-                !link_cfg.confirm_offer,
-                "attempt {attempt} must not prompt"
-            );
+            assert!(!link_cfg.confirm_offer, "attempt {attempt} must not prompt");
             assert!(
                 link_cfg.patient,
                 "attempt {attempt} still needs long timeouts: the peer may be \

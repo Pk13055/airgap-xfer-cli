@@ -221,7 +221,9 @@ fn capture_loop(index: u32, shared: &Shared) -> Result<()> {
                     0 => gap,
                     current => (current * 3 + gap) / 4,
                 };
-                shared.decode_gap_ms.store(smoothed.max(1), Ordering::Relaxed);
+                shared
+                    .decode_gap_ms
+                    .store(smoothed.max(1), Ordering::Relaxed);
             }
             if let Ok(mut slot) = shared.decoded.lock() {
                 push_unique(&mut slot, payload);
@@ -262,12 +264,16 @@ mod tests {
             role: 2,
         };
         let data0 = Payload::Data {
-            seq: 0,
-            chunk: vec![1],
+            transfer_id: 1,
+            first: 0,
+            count: 1,
+            bytes: vec![1],
         };
         let data1 = Payload::Data {
-            seq: 1,
-            chunk: vec![2],
+            transfer_id: 1,
+            first: 1,
+            count: 1,
+            bytes: vec![2],
         };
 
         push_unique(&mut slot, hello.clone());
@@ -286,8 +292,10 @@ mod tests {
             push_unique(
                 &mut slot,
                 Payload::Data {
-                    seq,
-                    chunk: vec![seq as u8],
+                    transfer_id: 1,
+                    first: seq,
+                    count: 1,
+                    bytes: vec![seq as u8],
                 },
             );
         }
@@ -295,8 +303,10 @@ mod tests {
         assert_eq!(
             slot.pending.front(),
             Some(&Payload::Data {
-                seq: 1,
-                chunk: vec![1]
+                transfer_id: 1,
+                first: 1,
+                count: 1,
+                bytes: vec![1]
             })
         );
     }

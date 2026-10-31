@@ -1,3 +1,4 @@
+use crate::frame::Payload;
 use std::path::PathBuf;
 use thiserror::Error;
 
@@ -27,7 +28,18 @@ pub enum Error {
     Interrupted,
     #[error("aborted by operator")]
     Aborted,
-    #[error("terminal too small: need at least {need_cols}x{need_rows}, have {have_cols}x{have_rows}")]
+    /// The peer started a new handshake (HELLO, PROBE or LINK) while this
+    /// side was mid-transfer. The payload is kept so the next handshake can
+    /// consume it: the peer will not show it "again".
+    #[error("peer restarted the handshake")]
+    Restart(Box<Payload>),
+    #[error("the other side runs protocol v{peer}; this build speaks v{ours}. Install the same airgap-xfer on both machines")]
+    ProtocolMismatch { peer: u8, ours: u8 },
+    #[error("receiver refused the offer: {0}")]
+    Refused(&'static str),
+    #[error(
+        "terminal too small: need at least {need_cols}x{need_rows}, have {have_cols}x{have_rows}"
+    )]
     TerminalTooSmall {
         need_cols: u16,
         need_rows: u16,

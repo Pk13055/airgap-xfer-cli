@@ -4,7 +4,7 @@ use image::{GrayImage, Luma};
 use qrcode::bits::Bits;
 use qrcode::{Color, EcLevel, QrCode, Version};
 
-use crate::{frame, Error, Result};
+use crate::{chunks::CHUNK_BYTES, frame, Error, Result};
 
 const QUIET_ZONE_MODULES: usize = 4;
 const MODULE_SCALE: usize = 4;
@@ -56,24 +56,44 @@ pub fn encode_version(data: &[u8], version: u8) -> Result<GrayImage> {
     Ok(image)
 }
 
-/// Checks that a full-size DATA envelope fits in `version` under byte mode.
-///
-/// Call this after the link is locked and before GO, so a capacity mistake
-/// fails the handshake instead of crashing the sender while the receiver
-/// waits for DATA and reports a stall on sequences 0–31.
-pub fn ensure_full_data_frame_fits(version: u8) -> Result<()> {
-    let chunk = vec![0xA5u8; frame::data_chunk_size(version)];
-    let bytes = frame::encode(&frame::Payload::Data { seq: 0, chunk })?;
+fn ensure_fits(bytes: &[u8], version: u8) -> Result<()> {
     let cap = frame::qr_byte_capacity(version);
     if bytes.len() > cap {
         return Err(too_long(version, bytes.len(), &format!("max {cap}")));
     }
     let mut bits = Bits::new(Version::Normal(version as i16));
-    bits.push_byte_data(&bytes)
+    bits.push_byte_data(bytes)
         .map_err(|_| too_long(version, bytes.len(), "byte mode"))?;
     bits.push_terminator(EcLevel::Q)
         .map_err(|_| too_long(version, bytes.len(), "terminator"))?;
     Ok(())
+}
+
+/// Checks that the largest DATA span and the largest progress report both
+/// fit `version` under byte mode.
+///
+/// Call this after the link is locked and before GO, so a capacity mistake
+/// fails the handshake instead of crashing a side mid-transfer.
+pub fn ensure_full_data_frame_fits(version: u8) -> Result<()> {
+    let count = frame::chunks_per_frame(version);
+    if count == 0 {
+        let need = frame::ENVELOPE_OVERHEAD + frame::DATA_HEADER + CHUNK_BYTES;
+        return Err(too_long(version, need, "no room for one chunk"));
+    }
+    let data = frame::Payload::Data {
+        transfer_id: u64::MAX,
+        first: u32::MAX - count,
+        count: count as u8,
+        bytes: vec![0xA5; count as usize * CHUNK_BYTES],
+    };
+    let progress = frame::Payload::Progress {
+        transfer_id: u64::MAX,
+        serial: u16::MAX,
+        contiguous: u32::MAX,
+        bitmaps: vec![u32::MAX; frame::progress_windows(version)],
+    };
+    ensure_fits(&frame::encode(&data)?, version)?;
+    ensure_fits(&frame::encode(&progress)?, version)
 }
 
 /// Total module count per side for `version`, including the quiet zone.
@@ -102,14 +122,10 @@ pub const SUPPORTED_VERSIONS: [u8; 6] = [10, 15, 20, 25, 30, 40];
 /// A clipped QR code is undecodable, so both peers must refuse to negotiate a
 /// version their own display cannot draw in full.
 pub fn max_version_for_area(cols: u16, rows: u16) -> Option<u8> {
-    SUPPORTED_VERSIONS
-        .iter()
-        .copied()
-        .rev()
-        .find(|&version| {
-            let (need_cols, need_rows) = cell_size_for_version(version);
-            need_cols <= cols && need_rows <= rows
-        })
+    SUPPORTED_VERSIONS.iter().copied().rev().find(|&version| {
+        let (need_cols, need_rows) = cell_size_for_version(version);
+        need_cols <= cols && need_rows <= rows
+    })
 }
 
 /// How many copies of `version` fit in a `cols` x `rows` pane, packed in a
@@ -287,7 +303,7 @@ mod tests {
         // Regression: rxing's `detect_in_luma` swaps width and height, so a
         // square test image round-trips happily while every 1920x1080 camera
         // frame is read transposed and decodes as nothing.
-        let payload = frame::encode(&frame::Payload::Ok).unwrap();
+        let payload = frame::encode(&frame::Payload::Ok { transfer_id: 7 }).unwrap();
         let code = encode_version(&payload, 10).unwrap();
         let mut canvas = image::GrayImage::from_pixel(1920, 1080, Luma([255]));
         for y in 0..code.height() {
@@ -302,7 +318,10 @@ mod tests {
     fn decoding_reports_where_the_code_was_found() {
         let code = encode_version(b"AX-points", 10).unwrap();
         let (_, points) = decode_with_points(&code).unwrap();
-        assert!(points.len() >= 3, "expected a locatable quad, got {points:?}");
+        assert!(
+            points.len() >= 3,
+            "expected a locatable quad, got {points:?}"
+        );
         for (x, y) in points {
             assert!(x >= 0.0 && x <= code.width() as f32, "{x}");
             assert!(y >= 0.0 && y <= code.height() as f32, "{y}");
@@ -312,8 +331,10 @@ mod tests {
     #[test]
     fn qr_roundtrip_binary_envelope() {
         let payload = frame::Payload::Data {
-            seq: 1,
-            chunk: (0u8..=80).collect(),
+            transfer_id: 1,
+            first: 1,
+            count: 1,
+            bytes: (0u8..=80).collect(),
         };
         let bytes = frame::encode(&payload).unwrap();
         let img = encode_version(&bytes, 15).unwrap();
@@ -325,19 +346,24 @@ mod tests {
     fn a_full_data_chunk_fits_every_supported_version() {
         for version in SUPPORTED_VERSIONS {
             let cap = frame::qr_byte_capacity(version);
-            let chunk = vec![0xA5u8; frame::data_chunk_size(version)];
-            let bytes = frame::encode(&frame::Payload::Data { seq: 0, chunk }).unwrap();
+            let count = frame::chunks_per_frame(version);
+            assert!(count >= 1, "v{version} must carry at least one chunk");
+            let bytes = frame::encode(&frame::Payload::Data {
+                transfer_id: u64::MAX,
+                first: 0,
+                count: count as u8,
+                bytes: vec![0xA5u8; count as usize * CHUNK_BYTES],
+            })
+            .unwrap();
             assert!(
                 bytes.len() <= cap,
                 "v{version}: DATA envelope {} > capacity {cap}",
                 bytes.len()
             );
-            encode_version(&bytes, version).unwrap_or_else(|err| {
-                panic!("v{version} full DATA chunk must encode, got {err}")
-            });
-            encode_version(&vec![0xFFu8; cap], version).unwrap_or_else(|err| {
-                panic!("v{version} capacity {cap} must encode, got {err}")
-            });
+            encode_version(&bytes, version)
+                .unwrap_or_else(|err| panic!("v{version} full DATA span must encode, got {err}"));
+            encode_version(&vec![0xFFu8; cap], version)
+                .unwrap_or_else(|err| panic!("v{version} capacity {cap} must encode, got {err}"));
             ensure_full_data_frame_fits(version).unwrap_or_else(|err| {
                 panic!("v{version} handshake preflight must pass, got {err}")
             });
@@ -393,15 +419,23 @@ mod tests {
 
     #[test]
     fn decode_all_finds_two_codes_on_one_canvas() {
-        let left = frame::encode(&frame::Payload::Ok).unwrap();
-        let right = frame::encode(&frame::Payload::Fin { sha256: [9; 32] }).unwrap();
+        let left = frame::encode(&frame::Payload::Ok { transfer_id: 1 }).unwrap();
+        let right = frame::encode(&frame::Payload::Fin {
+            transfer_id: 1,
+            sha256: [9; 32],
+        })
+        .unwrap();
         let a = encode_version(&left, 10).unwrap();
         let b = encode_version(&right, 10).unwrap();
         let gap = 48;
-        let mut canvas = GrayImage::from_pixel(a.width() + gap + b.width(), a.height(), Luma([255]));
+        let mut canvas =
+            GrayImage::from_pixel(a.width() + gap + b.width(), a.height(), Luma([255]));
         blit(&mut canvas, &a, 0, 0);
         blit(&mut canvas, &b, a.width() + gap, 0);
-        let found: HashSet<Vec<u8>> = decode_all(&canvas).into_iter().map(|(bytes, _)| bytes).collect();
+        let found: HashSet<Vec<u8>> = decode_all(&canvas)
+            .into_iter()
+            .map(|(bytes, _)| bytes)
+            .collect();
         assert!(found.contains(&left), "missing left code, got {found:?}");
         assert!(found.contains(&right), "missing right code, got {found:?}");
     }

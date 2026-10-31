@@ -3,13 +3,11 @@ use std::fs;
 use std::path::PathBuf;
 
 use crate::{
-    frame,
-    link,
-    live,
+    chunks, frame, live,
     optical::Optical,
     pack,
-    session,
-    tui,
+    resume::{self, Offer},
+    session, tui,
 };
 
 /// A version 10 QR code is 65 columns by 33 rows once drawn two modules per
@@ -100,25 +98,35 @@ fn send(path: PathBuf, camera: u32, keep_temp: bool, no_invert: bool) -> crate::
     let temp_path = packed.temp_path.clone();
     let warnings = std::mem::take(&mut packed.warnings);
     let title = format!("airgap-xfer · SEND {}", packed.basename);
-    let result = tui::run(&title, camera, no_invert, tui::Aim::EnterWhenLocked, move |mut opt, max_version| {
-        let blob = fs::read(&packed.temp_path)?;
-        let done = session::send_with_fallback(
-            &mut opt,
-            &packed.basename,
-            packed.uncompressed_hint,
-            &blob,
-            packed.sha256,
-            max_version,
-        )?;
-        Ok(format!(
-            "sent {} ({} B in {} chunks at QR v{}{})",
-            done.session.basename,
-            done.session.compressed_size,
-            done.session.chunk_count,
-            done.session.qr_version,
-            attempt_note(done.attempt)
-        ))
-    });
+    let result = tui::run(
+        &title,
+        camera,
+        no_invert,
+        tui::Aim::EnterWhenLocked,
+        move |mut opt, max_version| {
+            let blob = fs::read(&packed.temp_path)?;
+            let offer = Offer::new(
+                packed.basename.clone(),
+                packed.uncompressed_hint,
+                blob.len() as u64,
+                packed.sha256,
+                resume::process_nonce(),
+            )
+            .ok_or_else(|| {
+                crate::Error::Message(format!("{} has too many chunks to number", packed.basename))
+            })?;
+            let done = session::send_with_fallback(&mut opt, &offer, &blob, max_version)?;
+            Ok(format!(
+                "sent {} ({} B in {} chunks of {} B, finished at QR v{}{})",
+                offer.basename,
+                offer.compressed_size,
+                offer.chunk_count,
+                chunks::CHUNK_BYTES,
+                done.session.qr_version,
+                attempt_note(done.attempt)
+            ))
+        },
+    );
 
     live::set_temp_path(None);
     if !keep_temp {
@@ -130,13 +138,13 @@ fn send(path: PathBuf, camera: u32, keep_temp: bool, no_invert: bool) -> crate::
     result
 }
 
-/// Mentions which rung of the fallback ladder finally worked, and says nothing
-/// when the first attempt did.
+/// Says how many reconnects the transfer needed, and nothing when the first
+/// link carried it all the way.
 fn attempt_note(attempt: usize) -> String {
-    if attempt == 0 {
-        String::new()
-    } else {
-        format!(", attempt {}/{}", attempt + 1, link::MAX_ATTEMPTS)
+    match attempt {
+        0 => String::new(),
+        1 => ", after 1 reconnect".into(),
+        n => format!(", after {n} reconnects"),
     }
 }
 
@@ -148,57 +156,69 @@ fn recv(
     no_invert: bool,
 ) -> crate::Result<()> {
     let title = format!("airgap-xfer · RECV into {}", outdir.display());
-    tui::run(&title, camera, no_invert, tui::Aim::Immediate, move |mut opt, max_version| {
-        let (done, blob) =
-            session::recv_with_fallback(&mut opt, &outdir, force, max_version)?;
+    tui::run(
+        &title,
+        camera,
+        no_invert,
+        tui::Aim::Immediate,
+        move |mut opt, max_version| {
+            let (done, blob) = session::recv_with_fallback(&mut opt, &outdir, force, max_version)?;
+            let offer = done.session.offer.clone();
 
-        // recv_blob only verifies the hash; it deliberately does not send OK.
-        // The sender must not see OK until the blob is durably written (and
-        // unpacked) here, so write+unpack happens before we show OK/FAIL.
-        let archive_name = pack::archive_filename(&done.session.basename);
-        let archive_path = outdir.join(&archive_name);
-        if !keep_temp {
-            live::set_temp_path(Some(archive_path.clone()));
-        }
+            // recv_blob only verifies the hash; it deliberately does not send OK.
+            // The sender must not see OK until the blob is durably written (and
+            // unpacked) here, so write+unpack happens before we show OK/FAIL.
+            let archive_name = pack::archive_filename(&offer.basename);
+            let archive_path = outdir.join(&archive_name);
+            if !keep_temp {
+                live::set_temp_path(Some(archive_path.clone()));
+            }
 
-        opt.log(&format!("writing {archive_name}"));
-        let write_and_unpack = (|| -> crate::Result<()> {
-            if let Some(parent) = archive_path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::write(&archive_path, &blob)?;
-            // The `.tar.zst` is the received file. Unpack is a convenience;
-            // if it fails the archive stays so the operator can run
-            // `tar --zstd -xf {archive_name}` themselves.
-            pack::unpack(&archive_path, &outdir, force)?;
-            Ok(())
-        })();
+            opt.log(&format!("writing {archive_name}"));
+            let write_and_unpack = (|| -> crate::Result<()> {
+                if let Some(parent) = archive_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(&archive_path, &blob)?;
+                // The `.tar.zst` is the received file. Unpack is a convenience;
+                // if it fails the archive stays so the operator can run
+                // `tar --zstd -xf {archive_name}` themselves.
+                pack::unpack(&archive_path, &outdir, force)?;
+                Ok(())
+            })();
 
-        match &write_and_unpack {
-            Ok(()) => {
-                opt.show(&frame::Payload::Ok)?;
+            match &write_and_unpack {
+                Ok(()) => {
+                    opt.show(&frame::Payload::Ok {
+                        transfer_id: offer.transfer_id,
+                    })?;
+                }
+                Err(crate::Error::Io(io_err))
+                    if io_err.kind() == std::io::ErrorKind::StorageFull =>
+                {
+                    opt.show(&frame::Payload::Fail {
+                        transfer_id: offer.transfer_id,
+                        reason: frame::FAIL_DISK,
+                    })?;
+                }
+                Err(_) => {
+                    opt.show(&frame::Payload::Fail {
+                        transfer_id: offer.transfer_id,
+                        reason: frame::FAIL_PROTOCOL,
+                    })?;
+                }
             }
-            Err(crate::Error::Io(io_err)) if io_err.kind() == std::io::ErrorKind::StorageFull => {
-                opt.show(&frame::Payload::Fail {
-                    reason: frame::FAIL_DISK,
-                })?;
-            }
-            Err(_) => {
-                opt.show(&frame::Payload::Fail {
-                    reason: frame::FAIL_PROTOCOL,
-                })?;
-            }
-        }
 
-        live::set_temp_path(None);
-        write_and_unpack?;
-        Ok(format!(
-            "received {archive_name} into {} (unpacked {}){}",
-            outdir.display(),
-            done.session.basename,
-            attempt_note(done.attempt)
-        ))
-    })
+            live::set_temp_path(None);
+            write_and_unpack?;
+            Ok(format!(
+                "received {archive_name} into {} (unpacked {}){}",
+                outdir.display(),
+                offer.basename,
+                attempt_note(done.attempt)
+            ))
+        },
+    )
 }
 
 #[cfg(test)]

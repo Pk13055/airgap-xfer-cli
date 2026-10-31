@@ -93,6 +93,9 @@ mod tests {
             ),
             20
         );
-        assert_eq!(encode_version_for(&frame::Payload::Ok, 25), 25);
+        assert_eq!(
+            encode_version_for(&frame::Payload::Ok { transfer_id: 1 }, 25),
+            25
+        );
     }
 }
